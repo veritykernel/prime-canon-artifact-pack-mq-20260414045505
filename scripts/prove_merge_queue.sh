@@ -27,6 +27,60 @@ cleanup() {
 }
 trap cleanup EXIT
 
+wait_for_run() {
+  local repo="$1"
+  local workflow="$2"
+  local branch="$3"
+  local event="$4"
+  local head_sha="$5"
+  local loops="$6"
+
+  local status=""
+  local conclusion=""
+  local seen="false"
+
+  for _ in $(seq 1 "$loops"); do
+    RUN_JSON="$(gh run list --repo "$repo" --workflow "$workflow" --branch "$branch" --event "$event" --json status,conclusion,headSha,url --limit 20 2>/dev/null || echo '[]')"
+    status="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
+import json, sys
+runs = json.loads(sys.argv[1])
+head = sys.argv[2]
+found = next((r for r in runs if r.get("headSha")==head), None)
+print(found.get("status","") if found else "")
+PY
+)"
+    conclusion="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
+import json, sys
+runs = json.loads(sys.argv[1])
+head = sys.argv[2]
+found = next((r for r in runs if r.get("headSha")==head), None)
+print(found.get("conclusion","") if found else "")
+PY
+)"
+    if [ -n "${status:-}" ]; then
+      seen="true"
+    fi
+    echo "$event $workflow branch=$branch status=${status:-none} conclusion=${conclusion:-none}"
+    if [ "$status" = "completed" ]; then
+      break
+    fi
+    sleep 5
+  done
+
+  if [ "$seen" != "true" ]; then
+    echo "NO_RUN_CREATED"
+    return 10
+  fi
+
+  if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
+    echo "RUN_FAILED"
+    return 11
+  fi
+
+  echo "RUN_OK"
+  return 0
+}
+
 gh auth status
 
 if ! gh repo view "$MQ_REPO" >/dev/null 2>&1; then
@@ -39,52 +93,76 @@ else
   git remote add mq "https://github.com/$MQ_REPO.git"
 fi
 
-git push -u mq "$SOURCE_BRANCH:main"
+REPO_ID="$(gh repo view "$MQ_REPO" --json id --jq '.id')"
+
+gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/actions/permissions" -f enabled=true -f allowed_actions=all >/dev/null || true
+gh workflow enable "$WORKFLOW_FILE" --repo "$MQ_REPO" >/dev/null 2>&1 || true
+
+ORG_PERMS_JSON="$(gh api -H "Accept: application/vnd.github+json" "orgs/$ORG_SLUG/actions/permissions" 2>/dev/null || true)"
+if [ -n "$ORG_PERMS_JSON" ]; then
+  ENABLED_REPOSITORIES="$(python3 - <<'PY' "$ORG_PERMS_JSON"
+import json, sys
+print(json.loads(sys.argv[1]).get("enabled_repositories",""))
+PY
+)"
+  ALLOWED_ACTIONS="$(python3 - <<'PY' "$ORG_PERMS_JSON"
+import json, sys
+print(json.loads(sys.argv[1]).get("allowed_actions",""))
+PY
+)"
+  echo "org_enabled_repositories=$ENABLED_REPOSITORIES"
+  echo "org_allowed_actions=$ALLOWED_ACTIONS"
+
+  if [ "$ENABLED_REPOSITORIES" = "none" ]; then
+    echo "organization policy disables Actions for all repositories in $ORG_SLUG" >&2
+    exit 1
+  fi
+
+  if [ "$ALLOWED_ACTIONS" = "local_only" ]; then
+    echo "organization policy allows local actions only, but $WORKFLOW_FILE uses public actions" >&2
+    exit 1
+  fi
+
+  if [ "$ENABLED_REPOSITORIES" = "selected" ]; then
+    if ! gh api --method PUT -H "Accept: application/vnd.github+json" "orgs/$ORG_SLUG/actions/permissions/repositories/$REPO_ID" >/dev/null 2>&1; then
+      echo "organization policy uses selected repositories, and this token could not enable $MQ_REPO for Actions" >&2
+      echo "run: gh auth refresh -h github.com -s admin:org" >&2
+      exit 1
+    fi
+  fi
+fi
+
+MAIN_SHA="$(git rev-parse "$SOURCE_BRANCH")"
+git push mq "$SOURCE_BRANCH:main"
 gh api --method PATCH "repos/$MQ_REPO" -f default_branch=main >/dev/null
+
+MAIN_RESULT="$(wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "main" "push" "$MAIN_SHA" 36)" || true
+if [ "$MAIN_RESULT" = "NO_RUN_CREATED" ]; then
+  echo "no push run was created on main for $MQ_REPO" >&2
+  echo "most likely causes: org Actions policy still blocks the repo, or Actions are disabled at org level" >&2
+  if [ -z "$ORG_PERMS_JSON" ]; then
+    echo "for selected-repository org policies, refresh token scope first: gh auth refresh -h github.com -s admin:org" >&2
+  fi
+  exit 1
+fi
+if [ "$MAIN_RESULT" != "RUN_OK" ]; then
+  echo "main push workflow did not succeed in $MQ_REPO" >&2
+  exit 1
+fi
 
 git checkout -B "$PROOF_BRANCH" "$SOURCE_BRANCH"
 git commit --allow-empty -m "mq proof trigger $RUN_ID"
 PR_HEAD_SHA="$(git rev-parse HEAD)"
-git push -u mq "$PROOF_BRANCH"
+git push mq "$PROOF_BRANCH"
 
-STATUS=""
-CONCLUSION=""
-SEEN_PUSH_RUN="false"
-for _ in $(seq 1 36); do
-  RUN_JSON="$(gh run list --repo "$MQ_REPO" --workflow "$WORKFLOW_FILE" --branch "$PROOF_BRANCH" --event push --json status,conclusion,headSha --limit 20 2>/dev/null || echo '[]')"
-  STATUS="$(python3 - <<'PY' "$RUN_JSON" "$PR_HEAD_SHA"
-import json, sys
-runs = json.loads(sys.argv[1])
-head = sys.argv[2]
-found = next((r for r in runs if r.get("headSha")==head), None)
-print(found.get("status","") if found else "")
-PY
-)"
-  CONCLUSION="$(python3 - <<'PY' "$RUN_JSON" "$PR_HEAD_SHA"
-import json, sys
-runs = json.loads(sys.argv[1])
-head = sys.argv[2]
-found = next((r for r in runs if r.get("headSha")==head), None)
-print(found.get("conclusion","") if found else "")
-PY
-)"
-  if [ -n "${STATUS:-}" ]; then
-    SEEN_PUSH_RUN="true"
-  fi
-  echo "proof-branch push $WORKFLOW_NAME status=${STATUS:-none} conclusion=${CONCLUSION:-none}"
-  if [ "$STATUS" = "completed" ]; then
-    break
-  fi
-  sleep 5
-done
-
-if [ "$SEEN_PUSH_RUN" != "true" ]; then
-  echo "$WORKFLOW_NAME never triggered on push for $PROOF_BRANCH; check workflow branch filters" >&2
+PROOF_RESULT="$(wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "push" "$PR_HEAD_SHA" 36)" || true
+if [ "$PROOF_RESULT" = "NO_RUN_CREATED" ]; then
+  echo "no push run was created on proof branch $PROOF_BRANCH" >&2
+  echo "expected this branch to match workflow filter cycle-2/**" >&2
   exit 1
 fi
-
-if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
-  echo "$WORKFLOW_NAME did not complete successfully on proof-branch push in $MQ_REPO" >&2
+if [ "$PROOF_RESULT" != "RUN_OK" ]; then
+  echo "proof branch push workflow did not succeed in $MQ_REPO" >&2
   exit 1
 fi
 
@@ -161,35 +239,13 @@ echo "mq_repo=$MQ_REPO"
 echo "pr_number=$PR_NUMBER"
 echo "pr_url=$PR_URL"
 
-STATUS=""
-CONCLUSION=""
-for _ in $(seq 1 36); do
-  RUN_JSON="$(gh run list --repo "$MQ_REPO" --workflow "$WORKFLOW_FILE" --branch "$PROOF_BRANCH" --event pull_request --json status,conclusion,headSha,url --limit 20 2>/dev/null || echo '[]')"
-  STATUS="$(python3 - <<'PY' "$RUN_JSON" "$PR_HEAD_SHA"
-import json, sys
-runs = json.loads(sys.argv[1])
-head = sys.argv[2]
-found = next((r for r in runs if r.get("headSha")==head), None)
-print(found.get("status","") if found else "")
-PY
-)"
-  CONCLUSION="$(python3 - <<'PY' "$RUN_JSON" "$PR_HEAD_SHA"
-import json, sys
-runs = json.loads(sys.argv[1])
-head = sys.argv[2]
-found = next((r for r in runs if r.get("headSha")==head), None)
-print(found.get("conclusion","") if found else "")
-PY
-)"
-  echo "pr $WORKFLOW_NAME status=${STATUS:-none} conclusion=${CONCLUSION:-none}"
-  if [ "$STATUS" = "completed" ]; then
-    break
-  fi
-  sleep 5
-done
-
-if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
-  echo "$WORKFLOW_NAME did not complete successfully on pull_request for PR #$PR_NUMBER" >&2
+PR_RESULT="$(wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "pull_request" "$PR_HEAD_SHA" 36)" || true
+if [ "$PR_RESULT" = "NO_RUN_CREATED" ]; then
+  echo "no pull_request run was created for PR #$PR_NUMBER" >&2
+  exit 1
+fi
+if [ "$PR_RESULT" != "RUN_OK" ]; then
+  echo "pull_request workflow did not succeed for PR #$PR_NUMBER" >&2
   exit 1
 fi
 
@@ -198,6 +254,7 @@ gh pr merge --repo "$MQ_REPO" "$PROOF_BRANCH" --squash --match-head-commit "$PR_
 STATUS=""
 CONCLUSION=""
 RUN_URL=""
+SEEN_MG="false"
 for _ in $(seq 1 48); do
   RUN_JSON="$(gh run list --repo "$MQ_REPO" --workflow "$WORKFLOW_FILE" --event merge_group --json status,conclusion,url,displayTitle --limit 20 2>/dev/null || echo '[]')"
   STATUS="$(python3 - <<'PY' "$RUN_JSON"
@@ -218,12 +275,20 @@ runs = json.loads(sys.argv[1])
 print(runs[0].get("url","") if runs else "")
 PY
 )"
+  if [ -n "${STATUS:-}" ]; then
+    SEEN_MG="true"
+  fi
   echo "merge_group $WORKFLOW_NAME status=${STATUS:-none} conclusion=${CONCLUSION:-none}"
   if [ "$STATUS" = "completed" ]; then
     break
   fi
   sleep 5
 done
+
+if [ "$SEEN_MG" != "true" ]; then
+  echo "no merge_group run was created in $MQ_REPO" >&2
+  exit 1
+fi
 
 if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
   echo "merge_group $WORKFLOW_NAME did not complete successfully in $MQ_REPO" >&2
