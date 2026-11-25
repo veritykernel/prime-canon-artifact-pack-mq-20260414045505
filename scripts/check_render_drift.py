@@ -14,6 +14,7 @@ import yaml
 
 from render_binding import compute_view_hash
 from render_receipts import active_receipt_paths
+from validate_pack import load_yaml as load_bounded_yaml
 
 MAX_RENDER_BYTES = 16 * 1024 * 1024
 
@@ -21,8 +22,7 @@ MAX_RENDER_BYTES = 16 * 1024 * 1024
 def load_yaml(path: Path) -> dict:
     if path.is_symlink():
         raise ValueError(f"render input is a symlink: {path}")
-    with path.open("r", encoding="utf-8") as stream:
-        return yaml.safe_load(stream)
+    return load_bounded_yaml(path)
 
 
 def current_output_hash(path: Path) -> str | None:

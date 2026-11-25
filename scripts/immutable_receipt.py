@@ -18,6 +18,7 @@ def assert_new(repo: Path, path: Path) -> None:
 
 def write_new(repo: Path, path: Path, obj: dict) -> None:
     assert_new(repo, path)
+    payload = yaml.safe_dump(obj, sort_keys=False)
     directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
         try:
@@ -26,7 +27,7 @@ def write_new(repo: Path, path: Path, obj: dict) -> None:
         except FileExistsError as exc:
             raise SystemExit(f"immutable receipt already exists; create a successor generation: {path}") from exc
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(yaml.safe_dump(obj, sort_keys=False))
+            stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
     finally:

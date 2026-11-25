@@ -12,6 +12,7 @@ import yaml
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
 from render_binding import compute_view_hash
 from immutable_receipt import assert_new, write_new
+from validate_pack import load_yaml as load_bounded_yaml
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
 PLAN_KIND = "PRIME_CANON_RENDER_PLAN_V1"
@@ -29,7 +30,7 @@ def sha256_file(path: Path) -> str:
 def load_yaml(path: Path):
     if not path.exists():
         raise SystemExit(f"missing yaml: {path}")
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    return load_bounded_yaml(path)
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
@@ -69,8 +70,8 @@ def main() -> None:
 
     rendered_path.parent.mkdir(parents=True, exist_ok=True)
 
-    corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
-    view = yaml.safe_load(view_path.read_text(encoding="utf-8"))
+    corpus = load_yaml(corpus_index_path)
+    view = load_yaml(view_path)
     profile_cfg = load_yaml(profile_cfg_path)
     order_cfg = load_yaml(order_cfg_path)
     targets_cfg = load_yaml(targets_cfg_path)
@@ -283,7 +284,7 @@ def main() -> None:
         node_path = node_dir / f"node-{seq}.yaml"
         if not node_path.exists():
             raise SystemExit(f"missing node file for {node_id}: {node_path}")
-        node = yaml.safe_load(node_path.read_text(encoding="utf-8"))
+        node = load_yaml(node_path)
 
         flags = list(node["spec"].get("active_projection_flags", []))
         for item in default_projection_flags:
