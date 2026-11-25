@@ -18,11 +18,24 @@ WORKFLOW_FILE="publish-guard-check.yml"
 WORKFLOW_NAME="publish-guard-check"
 PROOF_BRANCH="cycle-2/mq-proof-$RUN_ID"
 CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+PROOF_REVIEWER="${PROOF_REVIEWER:-}"
 WAIT_STATUS=""
 WAIT_CONCLUSION=""
 WAIT_RUN_URL=""
 WAIT_RUN_HEAD_SHA=""
 WAIT_SEEN="false"
+
+# A proof copies the source commit to another repository. Never include a
+# caller's index or working tree, and require a distinct human reviewer for
+# changes to the publish guard and its check.
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  echo "merge-queue proof requires a clean source checkout" >&2
+  exit 1
+fi
+if [ -z "$PROOF_REVIEWER" ]; then
+  echo "set PROOF_REVIEWER to an independent reviewer before creating a proof" >&2
+  exit 1
+fi
 
 cleanup() {
   git checkout "$CURRENT_BRANCH" >/dev/null 2>&1 || true
@@ -90,9 +103,18 @@ wait_for_run() {
 }
 
 gh auth status
+ACTOR="$(gh api user --jq '.login')"
+if [ "$PROOF_REVIEWER" = "$ACTOR" ]; then
+  echo "proof reviewer must differ from the authenticated actor" >&2
+  exit 1
+fi
 
 if ! gh repo view "$MQ_REPO" >/dev/null 2>&1; then
-  gh api --method POST "orgs/$ORG_SLUG/repos" -f name="$REPO_NAME" -F private=false >/dev/null
+  gh api --method POST "orgs/$ORG_SLUG/repos" -f name="$REPO_NAME" -F private=true >/dev/null
+fi
+if [ "$(gh api "repos/$MQ_REPO" --jq '.private')" != "true" ]; then
+  echo "proof target must be private: $MQ_REPO" >&2
+  exit 1
 fi
 
 if git remote get-url mq >/dev/null 2>&1; then
@@ -159,7 +181,7 @@ else
 fi
 
 git checkout -B "$PROOF_BRANCH" "$SOURCE_BRANCH"
-git commit --allow-empty -m "mq proof trigger $RUN_ID"
+git -c user.name="$ACTOR" -c user.email="$ACTOR@users.noreply.github.com" commit --allow-empty -m "mq proof trigger $RUN_ID"
 PR_HEAD_SHA="$(git rev-parse HEAD)"
 git push mq "$PROOF_BRANCH"
 
@@ -200,6 +222,16 @@ cat <<'JSON'
           }
         ],
         "strict_required_status_checks_policy": true
+      }
+    },
+    {
+      "type": "pull_request",
+      "parameters": {
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": true,
+        "require_last_push_approval": true,
+        "required_approving_review_count": 1,
+        "required_review_thread_resolution": true
       }
     },
     {
@@ -251,6 +283,7 @@ echo "org_slug=$ORG_SLUG"
 echo "mq_repo=$MQ_REPO"
 echo "pr_number=$PR_NUMBER"
 echo "pr_url=$PR_URL"
+gh pr edit --repo "$MQ_REPO" "$PR_NUMBER" --add-reviewer "$PROOF_REVIEWER" >/dev/null
 
 if wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "pull_request" "$PR_HEAD_SHA" 36; then
   :
@@ -265,6 +298,20 @@ else
   exit 1
 fi
 
+echo "waiting for an independent approving review from $PROOF_REVIEWER" >&2
+REVIEW_APPROVED="false"
+for _ in $(seq 1 120); do
+  REVIEW_JSON="$(gh pr view --repo "$MQ_REPO" "$PR_NUMBER" --json headRefOid,reviewDecision 2>/dev/null || echo '{}')"
+  if printf '%s' "$REVIEW_JSON" | python3 -c 'import json,sys; x=json.load(sys.stdin); sys.exit(0 if x.get("headRefOid")==sys.argv[1] and x.get("reviewDecision")=="APPROVED" else 1)' "$PR_HEAD_SHA"; then
+    REVIEW_APPROVED="true"
+    break
+  fi
+  sleep 5
+done
+if [ "$REVIEW_APPROVED" != "true" ]; then
+  echo "exact proof head did not receive the required independent review" >&2
+  exit 1
+fi
 QUEUE_REQUESTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 gh pr merge --repo "$MQ_REPO" "$PROOF_BRANCH" --squash --match-head-commit "$PR_HEAD_SHA"
 

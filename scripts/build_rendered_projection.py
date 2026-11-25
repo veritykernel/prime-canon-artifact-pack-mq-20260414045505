@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import secrets
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,8 +27,41 @@ NODE_KIND = "PRIME_CANON_NODE_V1"
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+MAX_RENDER_BYTES = 16 * 1024 * 1024
+
+
+def write_rendered(repo: Path, path: Path, rendered_text: str) -> str:
+    raw = rendered_text.encode("utf-8")
+    if len(raw) > MAX_RENDER_BYTES:
+        raise SystemExit("rendered output exceeds size limit")
+    parent = path.parent
+    if (parent.is_symlink() or not parent.is_dir()
+            or parent.resolve(strict=True) != parent
+            or not parent.is_relative_to(repo)):
+        raise SystemExit("rendered output directory is not a regular repository directory")
+    if path.is_symlink() or (path.exists() and not stat.S_ISREG(path.lstat().st_mode)):
+        raise SystemExit("rendered output is a symlink or non-regular file")
+    directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    temp_name = f".{path.name}.{secrets.token_hex(12)}.tmp"
+    try:
+        fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                     0o644, dir_fd=directory_fd)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Replacing a path inside the already-open directory never writes
+            # through an entry that was swapped to a symlink.
+            os.replace(temp_name, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        finally:
+            try:
+                os.unlink(temp_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+    finally:
+        os.close(directory_fd)
+    return hashlib.sha256(raw).hexdigest()
 
 def load_yaml(path: Path):
     if not path.exists():
@@ -68,8 +104,6 @@ def main() -> None:
     assert_new(repo, execution_path)
     assert_new(repo, drift_path)
 
-    rendered_path.parent.mkdir(parents=True, exist_ok=True)
-
     corpus = load_yaml(corpus_index_path)
     view = load_yaml(view_path)
     profile_cfg = load_yaml(profile_cfg_path)
@@ -102,6 +136,8 @@ def main() -> None:
 
     if target_projection_flag not in allowed_projection_flags:
         raise SystemExit(f"target_projection_flag {target_projection_flag} not allowed by render-targets")
+    if target_projection_flag not in default_projection_flags:
+        raise SystemExit(f"target_projection_flag {target_projection_flag} is not enabled by default render targets")
     if default_output_format not in allowed_output_formats:
         raise SystemExit(f"default_output_format {default_output_format} not allowed by render-targets")
     if str(order_cfg["ordering_mode"]) != "active_node_refs":
@@ -286,26 +322,10 @@ def main() -> None:
             raise SystemExit(f"missing node file for {node_id}: {node_path}")
         node = load_yaml(node_path)
 
-        flags = list(node["spec"].get("active_projection_flags", []))
-        for item in default_projection_flags:
-            if item == target_projection_flag and item not in flags:
-                flags.append(item)
-        if "machine_readable" not in flags:
-            flags.insert(0, "machine_readable")
-
-        ordered = []
-        for item in ["machine_readable", "rendered_text", "exportable"]:
-            if item in flags and item not in ordered:
-                ordered.append(item)
-
-        node["spec"]["active_projection_flags"] = ordered
-        node["metadata"]["updated_at"] = now
-        node["attributes"]["temporal"]["reduced_at"] = now
-        node["attributes"]["temporal"]["status_since"] = now
-
+        # Rendering is a projection of an existing promoted node. It must not
+        # rewrite the promoted source object as a side effect.
         ensure_required_fields(repo, NODE_KIND, node["spec"])
         validate_instance(repo, node)
-        node_path.write_text(yaml.safe_dump(node, sort_keys=False), encoding="utf-8")
 
         node_objects.append(node)
         all_source_refs.extend(node["attributes"]["lineage"].get("source_refs", []))
@@ -353,8 +373,7 @@ def main() -> None:
         lines.append(f"- render_plan_ref: `{plan_id}`")
 
     rendered_text = "\n".join(lines) + "\n"
-    rendered_path.write_text(rendered_text, encoding="utf-8")
-    output_sha256 = sha256_file(rendered_path)
+    output_sha256 = write_rendered(repo, rendered_path, rendered_text)
 
     prior_receipts = list(view["spec"].get("derivation_receipt_refs", []))
 

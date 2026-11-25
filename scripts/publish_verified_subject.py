@@ -15,6 +15,7 @@ from render_binding import compute_view_hash
 from render_receipts import active_receipt_paths
 
 MAX_RENDER = 16 * 1024 * 1024
+APPROVED_PUBLISH_ROOT = Path("/Users/Shared/nuum-work/stage")
 
 
 def read_render(repo: Path, source: Path) -> bytes:
@@ -31,7 +32,7 @@ def read_render(repo: Path, source: Path) -> bytes:
     return raw
 
 
-def publish(repo: Path, subject: str) -> Path:
+def publish(repo: Path, subject: str, *, approved_root: Path = APPROVED_PUBLISH_ROOT) -> Path:
     repo = repo.resolve()
     if not SUBJECT.fullmatch(subject):
         raise PromotionRejected("invalid subject slug")
@@ -69,8 +70,13 @@ def publish(repo: Path, subject: str) -> Path:
     if not isinstance(target_value, str) or not target_value:
         raise PromotionRejected("missing publish target")
     target = Path(target_value)
-    if not target.is_absolute() or target.name != f"{subject}.rendered.md":
-        raise PromotionRejected("publish target must be the configured absolute subject file")
+    if (not approved_root.is_absolute() or approved_root.is_symlink()
+            or not approved_root.is_dir()
+            or (approved_root == APPROVED_PUBLISH_ROOT
+                and approved_root.resolve(strict=True) != APPROVED_PUBLISH_ROOT)):
+        raise PromotionRejected("approved publish root is absent or follows a symlink")
+    if target != approved_root / f"{subject}.rendered.md":
+        raise PromotionRejected("repository publish target differs from the approved stage destination")
     if target.is_symlink():
         raise PromotionRejected("publish target is a symlink")
     if not target.parent.is_dir() or target.parent.is_symlink():

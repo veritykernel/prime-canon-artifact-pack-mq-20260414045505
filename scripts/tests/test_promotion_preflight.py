@@ -240,7 +240,7 @@ class VerifiedPublicationTests(unittest.TestCase):
         cfg_path.write_text(yaml.safe_dump(cfg))
 
     def test_publishes_the_verified_bytes(self):
-        self.assertEqual(publish(self.repo, SUBJECT), self.target)
+        self.assertEqual(publish(self.repo, SUBJECT, approved_root=self.stage), self.target)
         self.assertEqual(self.target.read_bytes(), (self.repo / "views" / "rendered" / f"{SUBJECT}.md").read_bytes())
 
     def test_changed_render_cannot_replace_existing_publication(self):
@@ -248,7 +248,7 @@ class VerifiedPublicationTests(unittest.TestCase):
         source = self.repo / "views" / "rendered" / f"{SUBJECT}.md"
         source.write_text(source.read_text() + "\nchanged after drift check\n")
         with self.assertRaisesRegex(PromotionRejected, "rendered source bytes differ"):
-            publish(self.repo, SUBJECT)
+            publish(self.repo, SUBJECT, approved_root=self.stage)
         self.assertEqual(self.target.read_text(), "prior publication")
 
     def test_symlink_target_cannot_overwrite_operator_file(self):
@@ -256,7 +256,7 @@ class VerifiedPublicationTests(unittest.TestCase):
         protected.write_text("keep")
         self.target.symlink_to(protected)
         with self.assertRaisesRegex(PromotionRejected, "target is a symlink"):
-            publish(self.repo, SUBJECT)
+            publish(self.repo, SUBJECT, approved_root=self.stage)
         self.assertEqual(protected.read_text(), "keep")
 
     def test_changed_node_or_render_policy_blocks_publication(self):
@@ -264,13 +264,26 @@ class VerifiedPublicationTests(unittest.TestCase):
         node.write_text(node.read_text() + "\n# post-receipt edit\n")
         self.assertEqual(inspect(self.repo, SUBJECT)[1], "stale_view")
         with self.assertRaisesRegex(PromotionRejected, "render receipts and current view"):
-            publish(self.repo, SUBJECT)
+            publish(self.repo, SUBJECT, approved_root=self.stage)
         node.write_bytes((SOURCE / "canon" / "nodes" / SUBJECT / "node-0001.yaml").read_bytes())
         policy = self.repo / "control" / "render" / "render-order.default.yaml"
         policy.write_text(policy.read_text() + "\n# post-receipt edit\n")
         self.assertEqual(inspect(self.repo, SUBJECT)[1], "stale_view")
         with self.assertRaisesRegex(PromotionRejected, "render receipts and current view"):
-            publish(self.repo, SUBJECT)
+            publish(self.repo, SUBJECT, approved_root=self.stage)
+
+    def test_repository_cannot_redirect_publication_to_another_absolute_path(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        protected = outside / f"{SUBJECT}.rendered.md"
+        protected.write_text("keep")
+        cfg_path = self.repo / "control" / "publish" / "publish-targets.default.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text())
+        cfg["subjects"][SUBJECT]["rendered_markdown_path"] = str(protected)
+        cfg_path.write_text(yaml.safe_dump(cfg))
+        with self.assertRaisesRegex(PromotionRejected, "differs from the approved stage"):
+            publish(self.repo, SUBJECT, approved_root=self.stage)
+        self.assertEqual(protected.read_text(), "keep")
 
 
 if __name__ == "__main__":

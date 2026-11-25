@@ -4,11 +4,14 @@ from __future__ import annotations
 import csv
 import hashlib
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+
+from immutable_receipt import assert_new, write_new
 
 REQUIRED_COLUMNS = [
     "seq",
@@ -52,6 +55,8 @@ def sha256_text(parts):
 def main():
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("SUBJECT_SLUG", "subject-0001")
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
+        raise SystemExit("invalid subject slug")
     tsv_path = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else repo / "work_orders" / subject_slug / "source-units.tsv"
 
     corpus_index_path = repo / "canon" / "corpora" / subject_slug / "index.yaml"
@@ -73,8 +78,21 @@ def main():
 
     target_dir = repo / "canon" / "source_units" / subject_slug
     target_dir.mkdir(parents=True, exist_ok=True)
-
+    targets = []
     for row in rows:
+        try:
+            seq_num = int(row["seq"])
+        except ValueError as exc:
+            raise SystemExit("source unit sequence must be an integer") from exc
+        if not 1 <= seq_num <= 9999:
+            raise SystemExit("source unit sequence must be in 1..9999")
+        path = target_dir / f"unit-{seq_num:04d}.yaml"
+        if path in targets:
+            raise SystemExit(f"duplicate source unit sequence: {seq_num}")
+        assert_new(repo, path)
+        targets.append(path)
+
+    for row, out_path in zip(rows, targets):
         seq_num = int(row["seq"])
         seq = f"{seq_num:04d}"
         object_id = f"pc.source_unit.{subject_slug}.{seq}"
@@ -191,8 +209,7 @@ def main():
             },
         }
 
-        out_path = repo / rel_path
-        out_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        write_new(repo, out_path, data)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["lineage"]["source_refs"] = source_refs

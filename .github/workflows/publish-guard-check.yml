@@ -1,5 +1,8 @@
 name: publish-guard-check
 
+permissions:
+  contents: read
+
 on:
   pull_request:
   merge_group:
@@ -13,11 +16,21 @@ jobs:
   publish-guard-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out candidate
+        uses: actions/checkout@v4
+        with:
+          path: candidate
+          persist-credentials: false
+      - name: Check out trusted main policy
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: trusted
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Run publish guard usage check
+      - name: Check candidate with trusted policy
         run: |
           export PYTHONDONTWRITEBYTECODE=1
-          python3 scripts/check_publish_guard_usage.py .
+          python3 trusted/scripts/check_publish_guard_usage.py candidate

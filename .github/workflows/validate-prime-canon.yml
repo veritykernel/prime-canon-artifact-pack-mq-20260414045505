@@ -2,6 +2,8 @@ name: validate-prime-canon
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     paths:
       - "canon/**"
@@ -21,7 +23,7 @@ jobs:
           fetch-depth: 0
       - name: Preserve immutable receipt history
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
           if [[ "$BASE_SHA" =~ ^0+$ ]]; then
             BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
