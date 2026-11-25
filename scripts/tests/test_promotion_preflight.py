@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from promotion_preflight import PromotionRejected, preflight
 import promote_nodes_and_current_state
 from publish_verified_subject import publish
+from render_binding import compute_view_hash
+from check_render_drift import inspect
 
 
 SOURCE = Path(__file__).resolve().parents[2]
@@ -218,6 +220,17 @@ class VerifiedPublicationTests(unittest.TestCase):
         self.repo = self.root / "repo"
         for directory in ("control", "receipts", "views"):
             shutil.copytree(SOURCE / directory, self.repo / directory)
+        (self.repo / "canon").mkdir()
+        shutil.copytree(SOURCE / "canon" / "nodes", self.repo / "canon" / "nodes")
+        view_path = self.repo / "views" / "current" / f"{SUBJECT}.yaml"
+        drift_path = self.repo / "receipts" / "immutable" / SUBJECT / "render-drift.yaml"
+        view = yaml.safe_load(view_path.read_text())
+        drift = yaml.safe_load(drift_path.read_text())
+        current_hash = compute_view_hash(self.repo, SUBJECT, view)
+        view["spec"]["view_hash"] = current_hash
+        drift["spec"]["current_view_hash"] = current_hash
+        view_path.write_text(yaml.safe_dump(view, sort_keys=False))
+        drift_path.write_text(yaml.safe_dump(drift, sort_keys=False))
         self.stage = self.root / "stage"
         self.stage.mkdir()
         self.target = self.stage / f"{SUBJECT}.rendered.md"
@@ -245,6 +258,19 @@ class VerifiedPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(PromotionRejected, "target is a symlink"):
             publish(self.repo, SUBJECT)
         self.assertEqual(protected.read_text(), "keep")
+
+    def test_changed_node_or_render_policy_blocks_publication(self):
+        node = self.repo / "canon" / "nodes" / SUBJECT / "node-0001.yaml"
+        node.write_text(node.read_text() + "\n# post-receipt edit\n")
+        self.assertEqual(inspect(self.repo, SUBJECT)[1], "stale_view")
+        with self.assertRaisesRegex(PromotionRejected, "render receipts and current view"):
+            publish(self.repo, SUBJECT)
+        node.write_bytes((SOURCE / "canon" / "nodes" / SUBJECT / "node-0001.yaml").read_bytes())
+        policy = self.repo / "control" / "render" / "render-order.default.yaml"
+        policy.write_text(policy.read_text() + "\n# post-receipt edit\n")
+        self.assertEqual(inspect(self.repo, SUBJECT)[1], "stale_view")
+        with self.assertRaisesRegex(PromotionRejected, "render receipts and current view"):
+            publish(self.repo, SUBJECT)
 
 
 if __name__ == "__main__":

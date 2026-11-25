@@ -1,18 +1,37 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 import re
+import stat
 import sys
+from itertools import islice
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from immutable_receipt import assert_new, write_new
 
 CONTRADICTION_KIND = "PRIME_CANON_CONTRADICTION_BUNDLE_V1"
 SUPERSESSION_KIND = "PRIME_CANON_SUPERSESSION_EDGE_V1"
 RECEIPT_KIND = "PRIME_CANON_REDUCTION_DECISION_RECEIPT_V1"
+MAX_CLAIMS = 512
+MAX_TEXT = 8192
+MAX_YAML_BYTES = 2 * 1024 * 1024
+
+
+def read_yaml(path: Path) -> dict:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_YAML_BYTES:
+            raise SystemExit(f"scout input is not a bounded regular file: {path}")
+        raw = stream.read(MAX_YAML_BYTES + 1)
+    if len(raw) > MAX_YAML_BYTES:
+        raise SystemExit(f"scout input exceeds size limit: {path}")
+    return yaml.safe_load(raw)
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -23,9 +42,7 @@ def norm(s: str) -> str:
 def tokens(s: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", s.lower()))
 
-def jaccard(a: str, b: str) -> float:
-    ta = tokens(a)
-    tb = tokens(b)
+def jaccard(ta: set[str], tb: set[str]) -> float:
     if not ta or not tb:
         return 0.0
     return len(ta & tb) / len(ta | tb)
@@ -304,30 +321,34 @@ def main() -> None:
     contradiction_dir.mkdir(parents=True, exist_ok=True)
     supersession_dir.mkdir(parents=True, exist_ok=True)
     receipt_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = receipt_dir / "topology-scout-summary.yaml"
+    assert_new(repo, summary_path)
 
-    claim_files = sorted(p for p in claim_dir.glob("claim-*.yaml") if p.is_file())
-    admiss_files = sorted(p for p in admiss_dir.glob("admissibility-*.yaml") if p.is_file())
+    claim_files = sorted(islice((p for p in claim_dir.glob("claim-*.yaml") if p.is_file()), MAX_CLAIMS + 1))
+    admiss_files = sorted(islice((p for p in admiss_dir.glob("admissibility-*.yaml") if p.is_file()), MAX_CLAIMS + 1))
 
     if not claim_files:
         raise SystemExit(f"no candidate claim files found in {claim_dir}")
     if not admiss_files:
         raise SystemExit(f"no admissibility decision files found in {admiss_dir}")
+    if len(claim_files) > MAX_CLAIMS or len(admiss_files) > MAX_CLAIMS:
+        raise SystemExit(f"topology scout is limited to {MAX_CLAIMS} claims and decisions per run")
 
-    corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
+    corpus = read_yaml(corpus_index_path)
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
 
     admissibility_by_claim = {}
     cited_receipt_refs = []
     for path in admiss_files:
-        decision = yaml.safe_load(path.read_text(encoding="utf-8"))
+        decision = read_yaml(path)
         claim_ref = decision["spec"]["target_claim_ref"]
         admissibility_by_claim[claim_ref] = decision
         cited_receipt_refs.append(decision["metadata"]["object_id"])
 
     claims = []
     for path in claim_files:
-        claim = yaml.safe_load(path.read_text(encoding="utf-8"))
+        claim = read_yaml(path)
         if admissibility_passed(admissibility_by_claim.get(claim["spec"]["claim_id"], {})):
             claims.append(claim)
 
@@ -336,49 +357,61 @@ def main() -> None:
     contradiction_seq = 1
     supersession_seq = 1
     seen_pairs = set()
+    claim_texts = []
+    claim_tokens = []
+    claim_negations = []
+    claim_norms = []
+    for claim in claims:
+        body = claim["spec"]["normalized_claim_body"]
+        if not isinstance(body, str) or len(body) > MAX_TEXT:
+            raise SystemExit(f"claim body exceeds {MAX_TEXT} characters")
+        claim_texts.append(body)
+        claim_tokens.append(tokens(body))
+        claim_negations.append(has_negation(body))
+        claim_norms.append(norm(body))
 
     for i in range(len(claims)):
         left = claims[i]
-        left_text = left["spec"]["normalized_claim_body"]
+        left_text = claim_texts[i]
         left_type = claim_claim_type(left)
         for j in range(i + 1, len(claims)):
             right = claims[j]
-            right_text = right["spec"]["normalized_claim_body"]
+            right_text = claim_texts[j]
             right_type = claim_claim_type(right)
             pair_key = tuple(sorted([left["spec"]["claim_id"], right["spec"]["claim_id"]]))
             if pair_key in seen_pairs:
                 continue
             seen_pairs.add(pair_key)
 
-            overlap = jaccard(left_text, right_text)
+            overlap = jaccard(claim_tokens[i], claim_tokens[j])
             source_refs = sorted(set(left["attributes"]["lineage"].get("source_refs", []) + right["attributes"]["lineage"].get("source_refs", [])))
             source_unit_refs = sorted(set(left["attributes"]["lineage"].get("source_unit_refs", []) + right["attributes"]["lineage"].get("source_unit_refs", [])))
 
-            if overlap >= 0.60 and has_negation(left_text) != has_negation(right_text):
+            if overlap >= 0.60 and claim_negations[i] != claim_negations[j]:
                 contradiction = build_contradiction(repo, subject_slug, corpus_id, now, contradiction_seq, left, right, source_refs, source_unit_refs)
                 out = repo / contradiction["attributes"]["identity"]["canonical_home"]
-                out.write_text(yaml.safe_dump(contradiction, sort_keys=False), encoding="utf-8")
+                write_new(repo, out, contradiction)
                 contradiction_refs.append(contradiction["metadata"]["object_id"])
                 contradiction_seq += 1
                 continue
 
             same_scope = claim_scope_key(left) == claim_scope_key(right)
             neither_question = left_type != "question" and right_type != "question"
-            left_norm = norm(left_text)
-            right_norm = norm(right_text)
+            left_norm = claim_norms[i]
+            right_norm = claim_norms[j]
 
             if same_scope and neither_question:
                 if left_norm != right_norm and left_norm in right_norm and len(right_norm) - len(left_norm) >= 24:
                     edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, left, right, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
                     out = repo / edge["attributes"]["identity"]["canonical_home"]
-                    out.write_text(yaml.safe_dump(edge, sort_keys=False), encoding="utf-8")
+                    write_new(repo, out, edge)
                     supersession_refs.append(edge["metadata"]["object_id"])
                     supersession_seq += 1
                     continue
                 if left_norm != right_norm and right_norm in left_norm and len(left_norm) - len(right_norm) >= 24:
                     edge = build_supersession(repo, subject_slug, corpus_id, now, supersession_seq, right, left, source_refs, source_unit_refs, "successor claim strictly contains prior claim text and adds more specific scope")
                     out = repo / edge["attributes"]["identity"]["canonical_home"]
-                    out.write_text(yaml.safe_dump(edge, sort_keys=False), encoding="utf-8")
+                    write_new(repo, out, edge)
                     supersession_refs.append(edge["metadata"]["object_id"])
                     supersession_seq += 1
                     continue
@@ -397,7 +430,7 @@ def main() -> None:
         route_destination = "promotion-readiness"
 
     receipt = build_receipt(repo, subject_slug, corpus_id, now, route_outcome, blocker_state, rationale, cited_receipt_refs, cited_object_refs)
-    (repo / receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(receipt, sort_keys=False), encoding="utf-8")
+    write_new(repo, summary_path, receipt)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,8 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from render_binding import compute_view_hash
+from immutable_receipt import assert_new, write_new
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
 PLAN_KIND = "PRIME_CANON_RENDER_PLAN_V1"
@@ -19,9 +22,6 @@ NODE_KIND = "PRIME_CANON_NODE_V1"
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -34,6 +34,12 @@ def load_yaml(path: Path):
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    generation = sys.argv[3] if len(sys.argv) > 3 else "default"
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
+        raise SystemExit("invalid subject slug")
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", generation):
+        raise SystemExit("invalid render generation")
+    suffix = "" if generation == "default" else f"-{generation}"
 
     corpus_index_path = repo / "canon" / "corpora" / subject_slug / "index.yaml"
     view_path = repo / "views" / "current" / f"{subject_slug}.yaml"
@@ -55,6 +61,12 @@ def main() -> None:
     if not receipt_dir.exists():
         raise SystemExit(f"missing receipt dir: {receipt_dir}")
 
+    # Refuse a rerun before changing nodes, the view, or rendered output.
+    execution_path = receipt_dir / f"render-execution{suffix}.yaml"
+    drift_path = receipt_dir / f"render-drift{suffix}.yaml"
+    assert_new(repo, execution_path)
+    assert_new(repo, drift_path)
+
     rendered_path.parent.mkdir(parents=True, exist_ok=True)
 
     corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
@@ -68,9 +80,9 @@ def main() -> None:
     view_id = view["spec"]["view_id"]
     now = utc_now()
     rendered_rel_path = f"views/rendered/{subject_slug}.md"
-    execution_receipt_id = f"pc.render_execution_receipt.{subject_slug}.default"
-    drift_receipt_id = f"pc.render_drift_receipt.{subject_slug}.default"
-    plan_id = f"pc.render_plan.{subject_slug}.default"
+    execution_receipt_id = f"pc.render_execution_receipt.{subject_slug}.{generation}"
+    drift_receipt_id = f"pc.render_drift_receipt.{subject_slug}.{generation}"
+    plan_id = f"pc.render_plan.{subject_slug}.{generation}"
 
     default_output_format = str(profile_cfg["default_output_format"])
     target_projection_flag = str(profile_cfg["target_projection_flag"])
@@ -343,11 +355,7 @@ def main() -> None:
     rendered_path.write_text(rendered_text, encoding="utf-8")
     output_sha256 = sha256_file(rendered_path)
 
-    prior_receipts = [
-        ref for ref in view["spec"].get("derivation_receipt_refs", [])
-        if not ref.endswith(".rendered-projection")
-        and not ref.endswith(".default")
-    ]
+    prior_receipts = list(view["spec"].get("derivation_receipt_refs", []))
 
     execution_receipt = {
         "kind": EXEC_KIND,
@@ -365,7 +373,7 @@ def main() -> None:
             "identity": {
                 "corpus_id": corpus_id,
                 "subject_slug": subject_slug,
-                "canonical_home": f"receipts/immutable/{subject_slug}/render-execution.yaml",
+                "canonical_home": str(execution_path.relative_to(repo)),
             },
             "lineage": {
                 "source_refs": sorted(set(all_source_refs)),
@@ -396,7 +404,7 @@ def main() -> None:
             },
             "operational": {
                 "lane_ref": "rendered-projection",
-                "repo_home": f"receipts/immutable/{subject_slug}/render-execution.yaml",
+                "repo_home": str(execution_path.relative_to(repo)),
                 "active_state": "active",
                 "mirror_permissions": "local_only",
                 "route_destination": "export-prep",
@@ -435,15 +443,7 @@ def main() -> None:
     view["spec"]["rendered_projection_refs"] = [rendered_rel_path]
     view["spec"]["derivation_receipt_refs"] = prior_receipts + [execution_receipt_id, drift_receipt_id]
     view["spec"]["generated_at"] = now
-    view["spec"]["view_hash"] = sha256_text(
-        "|".join(
-            node_ids
-            + list(view["spec"].get("active_edge_refs", []))
-            + list(view["spec"].get("active_contradiction_refs", []))
-            + list(view["spec"].get("unresolved_blocker_refs", []))
-            + [rendered_rel_path, execution_receipt_id, drift_receipt_id, corpus_id, now]
-        )
-    )
+    view["spec"]["view_hash"] = compute_view_hash(repo, subject_slug, view)
 
     ensure_required_fields(repo, VIEW_KIND, view["spec"])
     validate_instance(repo, view)
@@ -467,7 +467,7 @@ def main() -> None:
             "identity": {
                 "corpus_id": corpus_id,
                 "subject_slug": subject_slug,
-                "canonical_home": f"receipts/immutable/{subject_slug}/render-drift.yaml",
+                "canonical_home": str(drift_path.relative_to(repo)),
             },
             "lineage": {
                 "source_refs": sorted(set(all_source_refs)),
@@ -498,7 +498,7 @@ def main() -> None:
             },
             "operational": {
                 "lane_ref": "rendered-projection",
-                "repo_home": f"receipts/immutable/{subject_slug}/render-drift.yaml",
+                "repo_home": str(drift_path.relative_to(repo)),
                 "active_state": "active",
                 "mirror_permissions": "local_only",
                 "route_destination": "export-prep",
@@ -528,8 +528,8 @@ def main() -> None:
     ensure_required_fields(repo, DRIFT_KIND, drift_receipt["spec"])
     validate_instance(repo, drift_receipt)
 
-    (repo / execution_receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(execution_receipt, sort_keys=False), encoding="utf-8")
-    (repo / drift_receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(drift_receipt, sort_keys=False), encoding="utf-8")
+    write_new(repo, execution_path, execution_receipt)
+    write_new(repo, drift_path, drift_receipt)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now

@@ -17,6 +17,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Preserve immutable receipt history
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
+          fi
+          python scripts/check_immutable_history.py "$BASE_SHA" "$GITHUB_SHA"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"

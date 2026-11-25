@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+SUBJECT_SLUG="${1:-subject-0001}"
+SUBJECT_TITLE="${2:-Subject 0001}"
+if [[ ${#SUBJECT_SLUG} -gt 64 || ! "$SUBJECT_SLUG" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+  echo "SUBJECT_SLUG must be a single lowercase letters, digits, and hyphens component (max 64 characters)" >&2
+  exit 2
+fi
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 if [ ! -x .venv/bin/python3 ]; then
   ./scripts/bootstrap_python.sh
 fi
 source .venv/bin/activate
-SUBJECT_SLUG="${1:-subject-0001}"
-SUBJECT_TITLE="${2:-Subject 0001}"
 INTAKE_SCOPE="${INTAKE_SCOPE:-Initial live subject bootstrap.}"
 if [ -z "${SOURCE_REF_1:-}" ]; then export SOURCE_REF_1="pending://subject-0001/source-0001"; fi
 if [ -z "${SOURCE_REF_2:-}" ]; then export SOURCE_REF_2="pending://subject-0001/source-0002"; fi
@@ -17,6 +21,7 @@ python3 - <<'PY'
 from pathlib import Path
 from datetime import datetime, timezone
 import os
+import re
 import yaml
 
 repo = Path(".").resolve()
@@ -31,8 +36,8 @@ for key in sorted(os.environ):
         if value:
             source_refs.append(value)
 
-if not subject_slug:
-    raise SystemExit("SUBJECT_SLUG must not be empty")
+if len(subject_slug) > 64 or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
+    raise SystemExit("SUBJECT_SLUG must be a single lowercase letters, digits, and hyphens component")
 if not subject_title:
     raise SystemExit("SUBJECT_TITLE must not be empty")
 if not source_refs:
@@ -54,13 +59,24 @@ runtime_dirs = [
     f"replay/manifests/{subject_slug}",
 ]
 
-for rel in runtime_dirs:
+def checked_directory(rel: str) -> Path:
     path = repo / rel
+    cursor = repo
+    for part in Path(rel).parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise SystemExit(f"Refusing symlinked bootstrap destination: {cursor}")
+    if not path.resolve(strict=False).is_relative_to(repo):
+        raise SystemExit(f"Bootstrap destination escapes repository: {path}")
+    return path
+
+for rel in runtime_dirs:
+    path = checked_directory(rel)
     path.mkdir(parents=True, exist_ok=True)
     if not rel.startswith("canon/corpora/"):
         (path / ".gitkeep").touch()
 
-(repo / "views/rendered").mkdir(parents=True, exist_ok=True)
+checked_directory("views/rendered").mkdir(parents=True, exist_ok=True)
 
 with template_index.open("r", encoding="utf-8") as fh:
     data = yaml.safe_load(fh)

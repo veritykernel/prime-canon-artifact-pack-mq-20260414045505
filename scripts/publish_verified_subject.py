@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 
 from promotion_preflight import PromotionRejected, SUBJECT, _yaml
+from render_binding import compute_view_hash
+from render_receipts import active_receipt_paths
 
 MAX_RENDER = 16 * 1024 * 1024
 
@@ -35,17 +37,25 @@ def publish(repo: Path, subject: str) -> Path:
         raise PromotionRejected("invalid subject slug")
     cfg, _ = _yaml(repo, repo / "control" / "publish" / "publish-targets.default.yaml")
     view, _ = _yaml(repo, repo / "views" / "current" / f"{subject}.yaml")
-    receipt_dir = repo / "receipts" / "immutable" / subject
-    execution, _ = _yaml(repo, receipt_dir / "render-execution.yaml")
-    drift, _ = _yaml(repo, receipt_dir / "render-drift.yaml")
+    try:
+        execution_path, drift_path = active_receipt_paths(repo, subject, view)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise PromotionRejected(f"current render receipt refs are invalid: {exc}") from exc
+    execution, _ = _yaml(repo, execution_path)
+    drift, _ = _yaml(repo, drift_path)
     expected_ref = f"views/rendered/{subject}.md"
     spec = execution["spec"]
     drift_spec = drift["spec"]
     view_spec = view["spec"]
+    try:
+        actual_view_hash = compute_view_hash(repo, subject, view)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise PromotionRejected(f"current render inputs could not be verified: {exc}") from exc
     if (spec.get("output_ref") != expected_ref or drift_spec.get("output_ref") != expected_ref
             or spec.get("target_view_ref") != view_spec.get("view_id")
             or drift_spec.get("target_view_ref") != view_spec.get("view_id")
             or drift_spec.get("current_view_hash") != view_spec.get("view_hash")
+            or actual_view_hash != view_spec.get("view_hash")
             or drift_spec.get("output_sha256") != spec.get("output_sha256")
             or drift_spec.get("drift_status") != "in_sync"
             or drift_spec.get("blocker") is not False
