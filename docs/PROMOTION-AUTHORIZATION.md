@@ -14,6 +14,7 @@ The approval is a JSON object with exactly these fields:
 ```json
 {
   "kind": "PRIME_CANON_PROMOTION_APPROVAL_V1",
+  "repository_head_sha": "<full SHA-1 of a clean committed checkout>",
   "subject_slug": "subject-0001",
   "corpus_id": "pc.corpus.subject-0001",
   "corpus_sha256": "<sha256 of corpus index bytes>",
@@ -39,6 +40,9 @@ approval, its SSH signature, and the allowed signers path via
 `PRIME_CANON_APPROVAL`, `PRIME_CANON_APPROVAL_SIGNATURE`, and
 `PRIME_CANON_ALLOWED_SIGNERS` respectively. An absent signer configuration
 causes a fail-closed result. No signer or approval is supplied in this pack.
+The approval binds the exact Git revision, and promotion rechecks that revision
+and clean state before its first write. An approval cannot be carried to a
+different commit even if the named data files remain byte-identical.
 
 For an approved new subject, run `python scripts/promote_nodes_and_current_state.py
 . <subject-slug>` with those environment variables set. The command rejects

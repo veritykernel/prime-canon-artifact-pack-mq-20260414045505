@@ -12,6 +12,9 @@ or dependencies are missing. It never activates the checkout's `.venv` or
 bootstraps packages from the checkout. The operator controls and pins that
 external environment separately; `requirements.txt` is not an install
 authorization or a package lock for guarded publication.
+The guard invokes reviewed entrypoints under isolated Python with trusted
+packages ahead of the checkout's script path, so a candidate `yaml.py` cannot
+shadow the installed YAML parser.
 
 The publisher checks the current view, render execution receipt, and drift
 receipt against the expected subject and output path. It reads the rendered

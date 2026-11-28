@@ -35,6 +35,9 @@ class PromotionPreflightTests(unittest.TestCase):
         self.repo = self.root / "repo"
         for directory in ("canon", "receipts", "replay", "schemas", "control"):
             shutil.copytree(SOURCE / directory, self.repo / directory)
+        subprocess.run(["/usr/bin/git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run(["/usr/bin/git", "config", "user.name", "Fixture reviewer"], cwd=self.repo, check=True)
+        subprocess.run(["/usr/bin/git", "config", "user.email", "reviewer@example.invalid"], cwd=self.repo, check=True)
         self.approval = self.root / "approval.json"
         self.signers = self.root / "allowed_signers"
         self.private = self.root / "reviewer_key"
@@ -44,6 +47,12 @@ class PromotionPreflightTests(unittest.TestCase):
         self.sign()
 
     def sign(self):
+        subprocess.run(["/usr/bin/git", "add", "-A"], cwd=self.repo, check=True)
+        pending = subprocess.run(["/usr/bin/git", "diff", "--cached", "--quiet"], cwd=self.repo)
+        if pending.returncode:
+            subprocess.run(["/usr/bin/git", "commit", "-qm", "Seal promotion fixture revision"],
+                           cwd=self.repo, check=True)
+        head = subprocess.check_output(["/usr/bin/git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
         receipt = self.repo / "receipts" / "immutable" / SUBJECT
         paths = {
             "packet_sha256": receipt / "promotion-readiness-packet.yaml",
@@ -56,6 +65,7 @@ class PromotionPreflightTests(unittest.TestCase):
         now = datetime.now(timezone.utc)
         body = {
             "kind": "PRIME_CANON_PROMOTION_APPROVAL_V1",
+            "repository_head_sha": head,
             "subject_slug": SUBJECT,
             "corpus_id": f"pc.corpus.{SUBJECT}",
             "corpus_sha256": hashlib.sha256((self.repo / "canon" / "corpora" / SUBJECT / "index.yaml").read_bytes()).hexdigest(),
@@ -133,6 +143,7 @@ class PromotionPreflightTests(unittest.TestCase):
         (receipt_dir / "promotion-lane-summary.yaml").unlink()
         for path in (self.repo / "canon" / "nodes" / SUBJECT).glob("node-*.yaml"):
             path.unlink()
+        self.sign()
         verified = self.check()
         with patch.object(promote_nodes_and_current_state, "preflight", return_value=verified), \
              patch.object(sys, "argv", ["promote", str(self.repo), SUBJECT]):
@@ -153,6 +164,15 @@ class PromotionPreflightTests(unittest.TestCase):
         body["expires_at"] = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
         self.approval.write_text(json.dumps(body, sort_keys=True))
         with self.assertRaisesRegex(PromotionRejected, "signature verification failed"):
+            self.check()
+
+    def test_signed_approval_cannot_replay_after_unrelated_git_revision(self):
+        self.make_policy_ready()
+        self.sign()
+        (self.repo / "REVISION-NOTE.txt").write_text("unrelated source revision\n")
+        subprocess.run(["/usr/bin/git", "add", "REVISION-NOTE.txt"], cwd=self.repo, check=True)
+        subprocess.run(["/usr/bin/git", "commit", "-qm", "Change revision"], cwd=self.repo, check=True)
+        with self.assertRaisesRegex(PromotionRejected, "approval does not bind"):
             self.check()
 
     def test_shadowed_path_cannot_approve_invalid_signature(self):

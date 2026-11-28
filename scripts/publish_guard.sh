@@ -34,6 +34,20 @@ finally:
 unset PYTHONPATH PYTHONHOME PYTHONUSERBASE VIRTUAL_ENV
 export PYTHONNOUSERSITE=1
 "$TRUSTED_PYTHON" -I -c 'import yaml, jsonschema'
+run_reviewed_script() {
+  local script="$1"
+  shift
+  "$TRUSTED_PYTHON" -I -c '
+import pathlib, runpy, sys
+repo = pathlib.Path(sys.argv[1])
+script = sys.argv[2]
+if script not in ("scripts/check_export_prep.py", "scripts/publish_verified_subject.py"):
+    raise SystemExit("unreviewed guarded script")
+sys.path.append(str(repo / "scripts"))
+sys.argv = [str(repo / script), *sys.argv[3:]]
+runpy.run_path(str(repo / script), run_name="__main__")
+' "$REPO" "$script" "$@"
+}
 SUBJECT_SLUG="${SUBJECT_SLUG:-subject-0001}"
 if [ "${1:-}" = "--" ]; then
   shift
@@ -50,8 +64,8 @@ if ! { [ "$#" -eq 4 ] && [ "$1" = python3 ] && [ "$2" = scripts/publish_verified
   echo "publish guard accepts only the verified subject publisher" >&2
   exit 64
 fi
-"$TRUSTED_PYTHON" scripts/check_export_prep.py "$REPO" "$SUBJECT_SLUG"
+run_reviewed_script scripts/check_export_prep.py "$REPO" "$SUBJECT_SLUG"
 if [ "$#" -eq 1 ]; then
   exec /usr/bin/true
 fi
-exec "$TRUSTED_PYTHON" scripts/publish_verified_subject.py "$REPO" "$SUBJECT_SLUG"
+run_reviewed_script scripts/publish_verified_subject.py "$REPO" "$SUBJECT_SLUG"

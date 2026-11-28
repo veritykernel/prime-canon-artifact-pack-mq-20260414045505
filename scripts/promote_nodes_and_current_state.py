@@ -11,7 +11,7 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
-from promotion_preflight import PromotionRejected, _open_repo_file, preflight
+from promotion_preflight import PromotionRejected, _open_repo_file, preflight, repository_revision
 from secure_projection_path import _open_directories
 
 NODE_KIND = "PRIME_CANON_NODE_V1"
@@ -129,6 +129,9 @@ def main() -> None:
     if hashlib.sha256(corpus_stream.read(2 * 1024 * 1024 + 1)).hexdigest() != frozen["corpus_sha256"]:
         corpus_stream.close()
         raise SystemExit("corpus changed after signed preflight; no promotion outputs written")
+    if repository_revision(repo) != frozen["repository_head_sha"]:
+        corpus_stream.close()
+        raise SystemExit("repository revision changed after signed preflight; no promotion outputs written")
     node_ids = []
     node_receipt_ids = []
     all_source_refs = []

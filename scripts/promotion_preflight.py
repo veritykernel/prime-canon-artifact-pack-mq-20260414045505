@@ -23,6 +23,7 @@ SUBJECT = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 PRINCIPAL = "human:reviewer"
 NAMESPACE = "prime-canon-promotion-v1"
 MAX_FILE = 2 * 1024 * 1024
+GIT = "/usr/bin/git"
 
 
 class PromotionRejected(ValueError):
@@ -75,6 +76,26 @@ def _yaml(repo: Path, path: Path) -> tuple[dict, bytes]:
 
 def _digest(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
+
+
+def repository_revision(repo: Path) -> str:
+    """Require one clean, committed repository revision for signer scope."""
+    command = [GIT, "-c", "core.fsmonitor=false", "-C", str(repo)]
+    environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                   "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+                   "GIT_OPTIONAL_LOCKS": "0"}
+    try:
+        head = subprocess.run(command + ["rev-parse", "--verify", "HEAD"],
+                              check=True, capture_output=True, text=True,
+                              env=environment, timeout=10).stdout.strip()
+        status = subprocess.run(command + ["status", "--porcelain", "--untracked-files=all"],
+                                check=True, capture_output=True, text=True,
+                                env=environment, timeout=10).stdout
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise PromotionRejected("cannot verify a clean committed repository revision") from exc
+    if not re.fullmatch(r"[0-9a-f]{40}", head) or status:
+        raise PromotionRejected("promotion requires a clean exact Git revision")
+    return head
 
 
 def _external_file(path: Path, repo: Path, *, root_owned: bool) -> bytes:
@@ -236,6 +257,7 @@ def preflight(repo: Path, subject: str, *, approval_path: Path | None = None,
         raise PromotionRejected("external signed human approval and trusted signer store are required")
     expected = {
         "kind": "PRIME_CANON_PROMOTION_APPROVAL_V1",
+        "repository_head_sha": repository_revision(repo),
         "subject_slug": subject,
         "corpus_id": corpus_id,
         "corpus_sha256": _digest(corpus_raw),
@@ -316,6 +338,7 @@ def preflight(repo: Path, subject: str, *, approval_path: Path | None = None,
     if any(obj["spec"].get("blocker_state") != "none" for obj, _, _ in objects.values()
            if obj.get("metadata", {}).get("object_id", "").endswith(".topology-scout")):
         raise PromotionRejected("topology contradiction gate has not passed")
-    return {"corpus": corpus, "corpus_sha256": _digest(corpus_raw), "packet": packet, "summary": summary,
+    return {"corpus": corpus, "corpus_sha256": _digest(corpus_raw),
+            "repository_head_sha": expected["repository_head_sha"], "packet": packet, "summary": summary,
             "manifest": manifest, "claims": claims, "links": links,
             "reviewer": reviewer, "approval_sha256": approval_hash}

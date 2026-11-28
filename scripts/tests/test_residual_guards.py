@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 import os
+import shlex
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -120,6 +121,31 @@ class ResidualGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "governed render body"):
             publish(self.repo, SUBJECT, approved_root=stage)
         self.assertEqual(list(stage.iterdir()), [])
+
+    def test_guarded_python_cannot_import_candidate_yaml_shadow(self):
+        self.stage_pack()
+        shutil.copytree(SOURCE / "scripts", self.repo / "scripts",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        marker = self.root / "shadow-import-executed"
+        shadow = self.repo / "scripts" / "yaml.py"
+        shadow.write_text(f"from pathlib import Path\nPath({str(marker)!r}).write_text('EXECUTED')\n"
+                          "raise RuntimeError('candidate module shadow')\n")
+        vulnerable = subprocess.run([sys.executable, str(self.repo / "scripts" / "check_export_prep.py"),
+                                     str(self.repo), SUBJECT], cwd=self.repo,
+                                    capture_output=True, text=True)
+        self.assertNotEqual(vulnerable.returncode, 0)
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        operator_python = self.root.resolve() / "operator-python"
+        operator_python.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n")
+        operator_python.chmod(0o700)
+        guarded = subprocess.run(["bash", str(self.repo / "scripts" / "publish_guard.sh"),
+                                  "--", "/usr/bin/true"], cwd=self.repo,
+                                 env={**os.environ, "PRIME_CANON_TRUSTED_PYTHON": str(operator_python)},
+                                 capture_output=True, text=True)
+        self.assertEqual(guarded.returncode, 2, guarded.stderr)
+        self.assertIn("drift_status=stale_view", guarded.stdout)
+        self.assertFalse(marker.exists())
 
     def test_render_builder_rejects_rendered_symlink_without_touching_host_file(self):
         self.stage_pack()

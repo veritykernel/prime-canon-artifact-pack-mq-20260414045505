@@ -14,7 +14,7 @@ from pathlib import Path
 
 MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 PINNED_ENTRYPOINTS = {
-    "scripts/publish_guard.sh": "5fc942afd2fd2cb8184ae41905fd981d48cafe05ab8b06c8651f082928ea3f1c",
+    "scripts/publish_guard.sh": "a02307353e0664f1e690c4a0ac8bf03b98f2d5b45e97ea350a513d817c7459e0",
     "scripts/publish_rendered_subject.sh": "30678d18e248f8109aaa57fa94fd1e04bd2fe964e6e1595cc8132079580c3591",
     "scripts/publish_verified_subject.py": "6a409758d3d99f793ed99b7ce0e150e8b6fb5d17809aa170e6d3932361d8cfbb",
     "scripts/bootstrap_python.sh": "76f6b6974916d30233782c801fed538dc51cc81153a0468aa68e0511ac09fac2",
