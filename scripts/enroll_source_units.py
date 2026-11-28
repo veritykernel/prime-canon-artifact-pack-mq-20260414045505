@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
+import io
 import os
+import re
+import secrets
+import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+from secure_projection_path import _open_directories
 
 REQUIRED_COLUMNS = [
     "seq",
@@ -20,15 +26,29 @@ REQUIRED_COLUMNS = [
     "scope",
     "normalized_text",
 ]
+MAX_TSV_BYTES = 2 * 1024 * 1024
+MAX_ROWS = 256
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def load_tsv(path: Path):
-    with path.open("r", encoding="utf-8", newline="") as fh:
+    if path.is_symlink():
+        raise SystemExit(f"TSV path is a symlink: {path}")
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TSV_BYTES:
+            raise SystemExit(f"TSV is not a bounded regular file: {path}")
+        raw = stream.read(MAX_TSV_BYTES + 1)
+    if len(raw) > MAX_TSV_BYTES:
+        raise SystemExit(f"TSV exceeds {MAX_TSV_BYTES} bytes: {path}")
+    with io.StringIO(raw.decode("utf-8"), newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         if reader.fieldnames is None:
             raise SystemExit(f"TSV has no header: {path}")
+        if len(reader.fieldnames) != len(set(reader.fieldnames)):
+            raise SystemExit(f"TSV has duplicate columns: {path}")
         missing = [c for c in REQUIRED_COLUMNS if c not in reader.fieldnames]
         if missing:
             raise SystemExit(f"TSV missing required columns {missing}: {path}")
@@ -40,6 +60,8 @@ def load_tsv(path: Path):
             for col in REQUIRED_COLUMNS:
                 if not clean.get(col):
                     raise SystemExit(f"{path}:{idx}: missing required value for {col}")
+            if len(rows) >= MAX_ROWS:
+                raise SystemExit(f"TSV exceeds {MAX_ROWS} rows: {path}")
             rows.append(clean)
         if not rows:
             raise SystemExit(f"No source rows found in {path}")
@@ -49,18 +71,34 @@ def sha256_text(parts):
     payload = "|".join(parts).encode("utf-8")
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
-def main():
-    repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
-    subject_slug = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("SUBJECT_SLUG", "subject-0001")
-    tsv_path = Path(sys.argv[3]).resolve() if len(sys.argv) > 3 else repo / "work_orders" / subject_slug / "source-units.tsv"
-
+def _enroll_locked(repo: Path, subject_slug: str, tsv_path: Path) -> None:
     corpus_index_path = repo / "canon" / "corpora" / subject_slug / "index.yaml"
-    if not corpus_index_path.exists():
+    if not corpus_index_path.exists() or corpus_index_path.is_symlink():
         raise SystemExit(f"Missing corpus index: {corpus_index_path}")
     rows = load_tsv(tsv_path)
+    normalized_rows = []
+    seen_sequences = set()
+    for row in rows:
+        raw_sequence = row["seq"]
+        if not re.fullmatch(r"[0-9]{1,4}", raw_sequence) or not 1 <= int(raw_sequence) <= 9999:
+            raise SystemExit(f"invalid source sequence: {raw_sequence}")
+        sequence = f"{int(raw_sequence):04d}"
+        if sequence in seen_sequences:
+            raise SystemExit(f"duplicate normalized source sequence: {sequence}")
+        seen_sequences.add(sequence)
+        normalized_rows.append((row, sequence))
 
-    with corpus_index_path.open("r", encoding="utf-8") as fh:
-        corpus = yaml.safe_load(fh)
+    corpus_directory_fd = _open_directories(repo, ("canon", "corpora", subject_slug))
+    try:
+        fd = os.open("index.yaml", os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK,
+                     dir_fd=corpus_directory_fd)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_TSV_BYTES:
+                raise SystemExit("corpus index is not a bounded regular file")
+            corpus = yaml.safe_load(stream.read(MAX_TSV_BYTES + 1))
+    finally:
+        os.close(corpus_directory_fd)
 
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
@@ -68,15 +106,20 @@ def main():
     owners = [x for x in os.environ.get("SOURCE_UNIT_OWNERS", "team:prime-canon").split(",") if x]
     tags = [x for x in os.environ.get("SOURCE_UNIT_TAGS", f"prime-canon,{subject_slug},source-unit").split(",") if x]
 
-    source_unit_ids = []
-    source_refs = []
+    source_unit_ids = list(corpus["attributes"]["lineage"].get("source_unit_refs", []))
+    source_refs = list(corpus["attributes"]["lineage"].get("source_refs", []))
 
     target_dir = repo / "canon" / "source_units" / subject_slug
-    target_dir.mkdir(parents=True, exist_ok=True)
+    if target_dir.is_symlink() or (target_dir.exists() and not target_dir.resolve().is_relative_to(repo)):
+        raise SystemExit("source-unit directory escapes repository")
+    for _, seq in normalized_rows:
+        object_id = f"pc.source_unit.{subject_slug}.{seq}"
+        output = target_dir / f"unit-{seq}.yaml"
+        if object_id in source_unit_ids or output.exists() or output.is_symlink():
+            raise SystemExit(f"source-unit identity already exists; reconcile before re-enrollment: {object_id}")
+    staged = []
 
-    for row in rows:
-        seq_num = int(row["seq"])
-        seq = f"{seq_num:04d}"
+    for row, seq in normalized_rows:
         object_id = f"pc.source_unit.{subject_slug}.{seq}"
         rel_path = f"canon/source_units/{subject_slug}/unit-{seq}.yaml"
         source_unit_ids.append(object_id)
@@ -85,8 +128,8 @@ def main():
 
         source_kind = row.get("source_kind", "") or "chat_message"
         burden_level = row.get("burden_level", "") or "medium"
-        sufficiency_status = row.get("sufficiency_status", "") or "sufficient"
-        evidence_class = row.get("evidence_class", "") or "direct_quote"
+        sufficiency_status = row.get("sufficiency_status", "") or "unscored"
+        evidence_class = row.get("evidence_class", "") or "human_assertion"
         risk_tier = row.get("risk_tier", "") or "medium"
         semantic_density = float(row.get("semantic_density", "") or "0.80")
         novelty_state = row.get("novelty_state", "") or "unknown"
@@ -191,8 +234,7 @@ def main():
             },
         }
 
-        out_path = repo / rel_path
-        out_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        staged.append((f"unit-{seq}.yaml", yaml.safe_dump(data, sort_keys=False)))
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["lineage"]["source_refs"] = source_refs
@@ -202,7 +244,71 @@ def main():
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["spec"]["source_refs"] = source_refs
     corpus["spec"]["source_count"] = len(source_refs)
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    corpus_payload = yaml.safe_dump(corpus, sort_keys=False)
+    directory_fd = _open_directories(repo, ("canon", "source_units", subject_slug), create_last=True)
+    created = []
+    committed = False
+    try:
+        # All rows and identities have been validated before the first write.
+        # Each provenance object is installed exclusively; a concurrent writer
+        # can cause a failed batch but can never replace an existing object.
+        for filename, payload in staged:
+            fd = os.open(filename, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                         0o644, dir_fd=directory_fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            created.append(filename)
+        os.fsync(directory_fd)
+        corpus_directory_fd = _open_directories(repo, ("canon", "corpora", subject_slug))
+        temporary_name = f".index.{secrets.token_hex(12)}.tmp"
+        try:
+            fd = os.open(temporary_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                         0o644, dir_fd=corpus_directory_fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(corpus_payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, corpus_index_path.name,
+                       src_dir_fd=corpus_directory_fd, dst_dir_fd=corpus_directory_fd)
+            committed = True
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=corpus_directory_fd)
+            except FileNotFoundError:
+                pass
+            os.close(corpus_directory_fd)
+    except BaseException:
+        if not committed:
+            for filename in created:
+                os.unlink(filename, dir_fd=directory_fd)
+        raise
+    finally:
+        os.close(directory_fd)
+
+
+def main() -> None:
+    repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
+    subject_slug = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("SUBJECT_SLUG", "subject-0001")
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
+        raise SystemExit("invalid subject slug")
+    tsv_path = Path(sys.argv[3]).absolute() if len(sys.argv) > 3 else repo / "work_orders" / subject_slug / "source-units.tsv"
+    corpus_directory_fd = _open_directories(repo, ("canon", "corpora", subject_slug))
+    try:
+        lock_fd = os.open(".enroll.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                          0o600, dir_fd=corpus_directory_fd)
+        try:
+            info = os.fstat(lock_fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or info.st_mode & 0o077 or info.st_size):
+                raise SystemExit("unsafe source enrollment lock file")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _enroll_locked(repo, subject_slug, tsv_path)
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(corpus_directory_fd)
 
 if __name__ == "__main__":
     main()

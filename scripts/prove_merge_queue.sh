@@ -1,303 +1,220 @@
 #!/usr/bin/env bash
+# Prove the merge-queue rule with a synthetic workflow in an owner-qualified
+# private fixture. Never mirror this repository or create a public repository.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-if command -v fnm >/dev/null 2>&1; then eval "$(fnm env --use-on-cd 2>/dev/null || fnm env 2>/dev/null)"; fi
-export PYTHONDONTWRITEBYTECODE=1
 export GH_PROMPT_DISABLED=1
 export GIT_PAGER=cat
+export PYTHONDONTWRITEBYTECODE=1
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO"
-
-ORG_SLUG="${ORG_SLUG:-veritykernel}"
-SOURCE_BRANCH="${SOURCE_BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
-RUN_ID="${RUN_ID:-$(date -u +%Y%m%d%H%M%S)}"
-REPO_NAME="${REPO_NAME:-prime-canon-artifact-pack-mq-$RUN_ID}"
-MQ_REPO="${MQ_REPO:-$ORG_SLUG/$REPO_NAME}"
-WORKFLOW_FILE="publish-guard-check.yml"
-WORKFLOW_NAME="publish-guard-check"
-PROOF_BRANCH="cycle-2/mq-proof-$RUN_ID"
-CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-
-cleanup() {
-  git checkout "$CURRENT_BRANCH" >/dev/null 2>&1 || true
-  if git show-ref --verify --quiet "refs/heads/$PROOF_BRANCH"; then
-    git branch -D "$PROOF_BRANCH" >/dev/null 2>&1 || true
+SOURCE_REPO="$(cd "$(dirname "$0")/.." && pwd)"
+SOURCE_NAME="veritykernel/prime-canon-artifact-pack-mq-20260414045505"
+SOURCE_HEAD="$(git -C "$SOURCE_REPO" rev-parse HEAD)"
+if [ "$(git -C "$SOURCE_REPO" rev-parse --show-toplevel)" != "$SOURCE_REPO" ] \
+   || [ "$(git -C "$SOURCE_REPO" branch --show-current)" != "main" ] \
+   || [ -n "$(git -C "$SOURCE_REPO" status --porcelain --untracked-files=all)" ] \
+   || [ "$SOURCE_HEAD" != "$(gh api "repos/$SOURCE_NAME/branches/main" --jq .commit.sha)" ]; then
+  echo "proof requires a clean checkout at the exact protected main commit" >&2
+  exit 4
+fi
+for proof_file in scripts/prove_merge_queue.sh scripts/select_proof_run.py; do
+  if [ "$(git -C "$SOURCE_REPO" hash-object "$proof_file")" != \
+       "$(git -C "$SOURCE_REPO" rev-parse "HEAD:$proof_file")" ]; then
+    echo "proof source differs from the protected commit: $proof_file" >&2
+    exit 4
   fi
-}
-trap cleanup EXIT
+done
+MQ_REPO="$(printenv MQ_REPO || true)"
+RETAIN_MQ_REPO="$(printenv RETAIN_MQ_REPO || true)"
+if [ -z "$MQ_REPO" ] || [ "$RETAIN_MQ_REPO" != "1" ]; then
+  echo "set MQ_REPO to a dedicated empty private veritykernel fixture and RETAIN_MQ_REPO=1" >&2
+  exit 4
+fi
+case "$MQ_REPO" in
+  veritykernel/*) ;;
+  *) echo "MQ_REPO must be owned by veritykernel" >&2; exit 4 ;;
+esac
+if [ "$MQ_REPO" = "veritykernel/$(basename "$SOURCE_REPO")" ]; then
+  echo "the source repository cannot be used as a proof fixture" >&2
+  exit 4
+fi
 
-wait_for_run() {
-  local repo="$1"
-  local workflow="$2"
-  local branch="$3"
-  local event="$4"
-  local head_sha="$5"
-  local loops="$6"
+METADATA="$(gh repo view "$MQ_REPO" --json nameWithOwner,isPrivate,isEmpty,description)"
+printf '%s' "$METADATA" | python3 -c '
+import json,sys
+repo=json.load(sys.stdin)
+if (repo.get("nameWithOwner") != sys.argv[1] or repo.get("isPrivate") is not True
+        or repo.get("isEmpty") is not True
+        or repo.get("description") != "prime-canon-merge-queue-fixture-v1"):
+    raise SystemExit("proof repository must be an exact empty private fixture with the required marker")
+' "$MQ_REPO"
+REVIEWER="vk-maintainer-joeyeoj69"
+REVIEWER_PERMISSION="$(gh api "repos/$MQ_REPO/collaborators/$REVIEWER/permission" --jq .permission)"
+case "$REVIEWER_PERMISSION" in
+  write|maintain|admin) ;;
+  *) echo "the distinct reviewer must have write authority on the proof fixture" >&2; exit 4 ;;
+esac
 
-  local status=""
-  local conclusion=""
-  local seen="false"
+WORK_DIR="$(mktemp -d /tmp/prime-mq-proof.XXXXXX)"
+trap 'rm -rf "$WORK_DIR"' EXIT
+PROOF_SELECTOR="$WORK_DIR/select_proof_run.py"
+cp "$SOURCE_REPO/scripts/select_proof_run.py" "$PROOF_SELECTOR"
+if [ "$(git -C "$SOURCE_REPO" hash-object "$PROOF_SELECTOR")" != \
+     "$(git -C "$SOURCE_REPO" rev-parse HEAD:scripts/select_proof_run.py)" ]; then
+  echo "proof selector snapshot changed after source validation" >&2
+  exit 4
+fi
+git -C "$WORK_DIR" init -q -b main
+git -C "$WORK_DIR" config user.name "PRIME synthetic proof"
+git -C "$WORK_DIR" config user.email "prime-proof@users.noreply.github.com"
+mkdir -p "$WORK_DIR/.github/workflows"
+printf '* @%s\n' "$REVIEWER" > "$WORK_DIR/.github/CODEOWNERS"
+cat > "$WORK_DIR/.github/workflows/publish-guard-check.yml" <<'YAML'
+name: publish-guard-check
+on:
+  push:
+  pull_request:
+  merge_group:
+permissions:
+  contents: read
+jobs:
+  publish-guard-check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: /usr/bin/true
+YAML
+git -C "$WORK_DIR" add .github/workflows/publish-guard-check.yml .github/CODEOWNERS
+git -C "$WORK_DIR" commit -qm "Add minimal synthetic merge-queue fixture"
+MAIN_SHA="$(git -C "$WORK_DIR" rev-parse HEAD)"
+git -C "$WORK_DIR" remote add mq "https://github.com/$MQ_REPO.git"
+git -C "$WORK_DIR" push mq HEAD:main
+DEFAULT_BRANCH="$(gh repo view "$MQ_REPO" --json defaultBranchRef --jq .defaultBranchRef.name)"
+if [ "$DEFAULT_BRANCH" != "main" ]; then
+  gh api --method PATCH "repos/$MQ_REPO" -f default_branch=main >/dev/null
+fi
 
-  for _ in $(seq 1 "$loops"); do
-    RUN_JSON="$(gh run list --repo "$repo" --workflow "$workflow" --branch "$branch" --event "$event" --json status,conclusion,headSha,url --limit 20 2>/dev/null || echo '[]')"
-    status="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
-import json, sys
-runs = json.loads(sys.argv[1])
-head = sys.argv[2]
-found = next((r for r in runs if r.get("headSha")==head), None)
-print(found.get("status","") if found else "")
-PY
-)"
-    conclusion="$(python3 - <<'PY' "$RUN_JSON" "$head_sha"
-import json, sys
-runs = json.loads(sys.argv[1])
-head = sys.argv[2]
-found = next((r for r in runs if r.get("headSha")==head), None)
-print(found.get("conclusion","") if found else "")
-PY
-)"
-    if [ -n "${status:-}" ]; then
-      seen="true"
+wait_run() {
+  event="$1"
+  expected_sha="$2"
+  merge_pr="$3"
+  not_before="$4"
+  for attempt in $(seq 1 48); do
+    RUN_JSON="$(gh run list --repo "$MQ_REPO" --workflow publish-guard-check.yml --event "$event" --json status,conclusion,headSha,headBranch,createdAt,event,url --limit 100)"
+    if [ -n "$merge_pr" ]; then
+      MATCH="$(printf '%s' "$RUN_JSON" | /usr/bin/python3 "$PROOF_SELECTOR" select --event "$event" --merge-pr "$merge_pr" --not-before "$not_before")"
+    else
+      MATCH="$(printf '%s' "$RUN_JSON" | /usr/bin/python3 "$PROOF_SELECTOR" select --event "$event" --head-sha "$expected_sha")"
     fi
-    echo "$event $workflow branch=$branch status=${status:-none} conclusion=${conclusion:-none}"
-    if [ "$status" = "completed" ]; then
-      break
+    IFS='|' read -r RUN_STATUS RUN_CONCLUSION RUN_URL RUN_SHA <<< "$MATCH"
+    if [ "$RUN_STATUS" = "completed" ]; then
+      [ "$RUN_CONCLUSION" = "success" ] || { echo "$event run failed: $RUN_URL" >&2; return 1; }
+      return 0
     fi
     sleep 5
   done
-
-  if [ "$seen" != "true" ]; then
-    echo "NO_RUN_CREATED"
-    return 10
-  fi
-
-  if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
-    echo "RUN_FAILED"
-    return 11
-  fi
-
-  echo "RUN_OK"
-  return 0
+  echo "no exact successful $event run was observed" >&2
+  return 1
 }
 
-gh auth status
-
-if ! gh repo view "$MQ_REPO" >/dev/null 2>&1; then
-  gh api --method POST "orgs/$ORG_SLUG/repos" -f name="$REPO_NAME" -F private=false >/dev/null
-fi
-
-if git remote get-url mq >/dev/null 2>&1; then
-  git remote set-url mq "https://github.com/$MQ_REPO.git"
-else
-  git remote add mq "https://github.com/$MQ_REPO.git"
-fi
-
-REPO_ID="$(gh repo view "$MQ_REPO" --json id --jq '.id')"
-
-gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/actions/permissions" -f enabled=true -f allowed_actions=all >/dev/null || true
-gh workflow enable "$WORKFLOW_FILE" --repo "$MQ_REPO" >/dev/null 2>&1 || true
-
-ORG_PERMS_JSON="$(gh api -H "Accept: application/vnd.github+json" "orgs/$ORG_SLUG/actions/permissions" 2>/dev/null || true)"
-if [ -n "$ORG_PERMS_JSON" ]; then
-  ENABLED_REPOSITORIES="$(python3 - <<'PY' "$ORG_PERMS_JSON"
-import json, sys
-print(json.loads(sys.argv[1]).get("enabled_repositories",""))
-PY
-)"
-  ALLOWED_ACTIONS="$(python3 - <<'PY' "$ORG_PERMS_JSON"
-import json, sys
-print(json.loads(sys.argv[1]).get("allowed_actions",""))
-PY
-)"
-  echo "org_enabled_repositories=$ENABLED_REPOSITORIES"
-  echo "org_allowed_actions=$ALLOWED_ACTIONS"
-
-  if [ "$ENABLED_REPOSITORIES" = "none" ]; then
-    echo "organization policy disables Actions for all repositories in $ORG_SLUG" >&2
-    exit 1
-  fi
-
-  if [ "$ALLOWED_ACTIONS" = "local_only" ]; then
-    echo "organization policy allows local actions only, but $WORKFLOW_FILE uses public actions" >&2
-    exit 1
-  fi
-
-  if [ "$ENABLED_REPOSITORIES" = "selected" ]; then
-    if ! gh api --method PUT -H "Accept: application/vnd.github+json" "orgs/$ORG_SLUG/actions/permissions/repositories/$REPO_ID" >/dev/null 2>&1; then
-      echo "organization policy uses selected repositories, and this token could not enable $MQ_REPO for Actions" >&2
-      echo "run: gh auth refresh -h github.com -s admin:org" >&2
-      exit 1
-    fi
-  fi
-fi
-
-MAIN_SHA="$(git rev-parse "$SOURCE_BRANCH")"
-git push mq "$SOURCE_BRANCH:main"
-gh api --method PATCH "repos/$MQ_REPO" -f default_branch=main >/dev/null
-
-MAIN_RESULT="$(wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "main" "push" "$MAIN_SHA" 36)" || true
-if [ "$MAIN_RESULT" = "NO_RUN_CREATED" ]; then
-  echo "no push run was created on main for $MQ_REPO" >&2
-  echo "most likely causes: org Actions policy still blocks the repo, or Actions are disabled at org level" >&2
-  if [ -z "$ORG_PERMS_JSON" ]; then
-    echo "for selected-repository org policies, refresh token scope first: gh auth refresh -h github.com -s admin:org" >&2
-  fi
-  exit 1
-fi
-if [ "$MAIN_RESULT" != "RUN_OK" ]; then
-  echo "main push workflow did not succeed in $MQ_REPO" >&2
-  exit 1
-fi
-
-git checkout -B "$PROOF_BRANCH" "$SOURCE_BRANCH"
-git commit --allow-empty -m "mq proof trigger $RUN_ID"
-PR_HEAD_SHA="$(git rev-parse HEAD)"
-git push mq "$PROOF_BRANCH"
-
-PROOF_RESULT="$(wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "push" "$PR_HEAD_SHA" 36)" || true
-if [ "$PROOF_RESULT" = "NO_RUN_CREATED" ]; then
-  echo "no push run was created on proof branch $PROOF_BRANCH" >&2
-  echo "expected this branch to match workflow filter cycle-2/**" >&2
-  exit 1
-fi
-if [ "$PROOF_RESULT" != "RUN_OK" ]; then
-  echo "proof branch push workflow did not succeed in $MQ_REPO" >&2
-  exit 1
-fi
-
-cat > /tmp/prime_canon_merge_queue_ruleset.json <<'JSON'
+wait_run push "$MAIN_SHA" "" ""
+RULESET_JSON="$(cat <<'JSON' | gh api --method POST "repos/$MQ_REPO/rulesets" --input -
 {
   "name": "required-ci-publish-guard-main-mq",
   "target": "branch",
   "enforcement": "active",
-  "conditions": {
-    "ref_name": {
-      "include": ["main"],
-      "exclude": []
-    }
-  },
+  "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
   "rules": [
-    {
-      "type": "required_status_checks",
-      "parameters": {
-        "do_not_enforce_on_create": false,
-        "required_status_checks": [
-          {
-            "context": "publish-guard-check"
-          }
-        ],
-        "strict_required_status_checks_policy": true
-      }
-    },
-    {
-      "type": "merge_queue",
-      "parameters": {
-        "check_response_timeout_minutes": 30,
-        "grouping_strategy": "HEADGREEN",
-        "max_entries_to_build": 1,
-        "max_entries_to_merge": 1,
-        "merge_method": "SQUASH",
-        "min_entries_to_merge": 1,
-        "min_entries_to_merge_wait_minutes": 0
-      }
-    }
+    {"type": "pull_request", "parameters": {
+      "allowed_merge_methods": ["squash"],
+      "dismiss_stale_reviews_on_push": true,
+      "require_code_owner_review": true,
+      "require_last_push_approval": true,
+      "required_approving_review_count": 1,
+      "required_review_thread_resolution": true
+    }},
+    {"type": "required_status_checks", "parameters": {
+      "do_not_enforce_on_create": false,
+      "required_status_checks": [{"context": "publish-guard-check"}],
+      "strict_required_status_checks_policy": true
+    }},
+    {"type": "merge_queue", "parameters": {
+      "check_response_timeout_minutes": 30,
+      "grouping_strategy": "HEADGREEN",
+      "max_entries_to_build": 1,
+      "max_entries_to_merge": 1,
+      "merge_method": "SQUASH",
+      "min_entries_to_merge": 1,
+      "min_entries_to_merge_wait_minutes": 0
+    }}
   ]
 }
 JSON
-
-RULESET_ID="$(gh api "repos/$MQ_REPO/rulesets" --jq '.[] | select(.name=="required-ci-publish-guard-main-mq") | .id' 2>/dev/null | head -n1 || true)"
-
-if [ -n "${RULESET_ID:-}" ]; then
-  gh api --method PUT -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets/$RULESET_ID" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
-else
-  gh api --method POST -H "Accept: application/vnd.github+json" "repos/$MQ_REPO/rulesets" --input /tmp/prime_canon_merge_queue_ruleset.json >/dev/null
-fi
-
-gh pr create --repo "$MQ_REPO" --base main --head "$PROOF_BRANCH" --title "mq proof $RUN_ID" --body "Deterministic merge queue proof for publish-guard-check." >/dev/null
-
-PR_JSON="$(gh pr view --repo "$MQ_REPO" "$PROOF_BRANCH" --json number,url,headRefOid)"
-export PR_JSON
-PR_NUMBER="$(python3 - <<'PY'
-import json, os
-print(json.loads(os.environ["PR_JSON"])["number"])
-PY
 )"
-PR_URL="$(python3 - <<'PY'
-import json, os
-print(json.loads(os.environ["PR_JSON"])["url"])
-PY
-)"
-PR_HEAD_SHA="$(python3 - <<'PY'
-import json, os
-print(json.loads(os.environ["PR_JSON"])["headRefOid"])
-PY
-)"
+RULESET_ID="$(printf '%s' "$RULESET_JSON" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+gh api "repos/$MQ_REPO/rulesets/$RULESET_ID" | /usr/bin/python3 -c '
+import json,sys
+ruleset=json.load(sys.stdin)
+rules={rule["type"]: rule for rule in ruleset.get("rules", [])}
+review=rules.get("pull_request", {}).get("parameters", {})
+checks=rules.get("required_status_checks", {}).get("parameters", {})
+if (ruleset.get("enforcement") != "active" or "merge_queue" not in rules
+        or review.get("required_approving_review_count", 0) < 1
+        or review.get("require_code_owner_review") is not True
+        or review.get("require_last_push_approval") is not True
+        or checks.get("strict_required_status_checks_policy") is not True
+        or not any(item.get("context") == "publish-guard-check"
+                   for item in checks.get("required_status_checks", []))):
+    raise SystemExit("synthetic ruleset does not enforce exact review and queue gates")
+'
 
-echo "org_slug=$ORG_SLUG"
-echo "mq_repo=$MQ_REPO"
-echo "pr_number=$PR_NUMBER"
-echo "pr_url=$PR_URL"
-
-PR_RESULT="$(wait_for_run "$MQ_REPO" "$WORKFLOW_FILE" "$PROOF_BRANCH" "pull_request" "$PR_HEAD_SHA" 36)" || true
-if [ "$PR_RESULT" = "NO_RUN_CREATED" ]; then
-  echo "no pull_request run was created for PR #$PR_NUMBER" >&2
-  exit 1
-fi
-if [ "$PR_RESULT" != "RUN_OK" ]; then
-  echo "pull_request workflow did not succeed for PR #$PR_NUMBER" >&2
-  exit 1
-fi
-
-gh pr merge --repo "$MQ_REPO" "$PROOF_BRANCH" --squash --match-head-commit "$PR_HEAD_SHA"
-
-STATUS=""
-CONCLUSION=""
-RUN_URL=""
-SEEN_MG="false"
-for _ in $(seq 1 48); do
-  RUN_JSON="$(gh run list --repo "$MQ_REPO" --workflow "$WORKFLOW_FILE" --event merge_group --json status,conclusion,url,displayTitle --limit 20 2>/dev/null || echo '[]')"
-  STATUS="$(python3 - <<'PY' "$RUN_JSON"
-import json, sys
-runs = json.loads(sys.argv[1])
-print(runs[0].get("status","") if runs else "")
-PY
-)"
-  CONCLUSION="$(python3 - <<'PY' "$RUN_JSON"
-import json, sys
-runs = json.loads(sys.argv[1])
-print(runs[0].get("conclusion","") if runs else "")
-PY
-)"
-  RUN_URL="$(python3 - <<'PY' "$RUN_JSON"
-import json, sys
-runs = json.loads(sys.argv[1])
-print(runs[0].get("url","") if runs else "")
-PY
-)"
-  if [ -n "${STATUS:-}" ]; then
-    SEEN_MG="true"
-  fi
-  echo "merge_group $WORKFLOW_NAME status=${STATUS:-none} conclusion=${CONCLUSION:-none}"
-  if [ "$STATUS" = "completed" ]; then
+RUN_ID="$(date -u +%Y%m%d%H%M%S)"
+PROOF_BRANCH="cycle-2/mq-proof-$RUN_ID"
+git -C "$WORK_DIR" switch -q -c "$PROOF_BRANCH"
+printf 'synthetic proof run %s\n' "$RUN_ID" > "$WORK_DIR/proof.txt"
+git -C "$WORK_DIR" add proof.txt
+git -C "$WORK_DIR" commit -qm "Trigger exact queue proof $RUN_ID"
+PR_HEAD_SHA="$(git -C "$WORK_DIR" rev-parse HEAD)"
+git -C "$WORK_DIR" push mq "HEAD:$PROOF_BRANCH"
+wait_run push "$PR_HEAD_SHA" "" ""
+gh pr create --repo "$MQ_REPO" --base main --head "$PROOF_BRANCH" --title "Synthetic merge queue proof $RUN_ID" --body "Contains only the minimal publish-guard-check workflow." >/dev/null
+PR_NUMBER="$(gh pr view --repo "$MQ_REPO" "$PROOF_BRANCH" --json number --jq .number)"
+wait_run pull_request "$PR_HEAD_SHA" "" ""
+gh pr edit --repo "$MQ_REPO" "$PR_NUMBER" --add-reviewer "$REVIEWER" >/dev/null
+REVIEW_APPROVED="false"
+for attempt in $(seq 1 48); do
+  gh pr view --repo "$MQ_REPO" "$PR_NUMBER" --json number,headRefOid,reviewDecision,author > "$WORK_DIR/review-pr.json"
+  gh api "repos/$MQ_REPO/pulls/$PR_NUMBER/reviews" > "$WORK_DIR/reviews.json"
+  if /usr/bin/python3 "$PROOF_SELECTOR" verify-review --pr "$PR_NUMBER" \
+       --head-sha "$PR_HEAD_SHA" --reviewer "$REVIEWER" \
+       "$WORK_DIR/review-pr.json" "$WORK_DIR/reviews.json"; then
+    REVIEW_APPROVED="true"
     break
   fi
   sleep 5
 done
+[ "$REVIEW_APPROVED" = "true" ] || { echo "exact-head independent reviewer approval was not observed" >&2; exit 1; }
 
-if [ "$SEEN_MG" != "true" ]; then
-  echo "no merge_group run was created in $MQ_REPO" >&2
-  exit 1
-fi
+QUEUE_REQUESTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+gh pr merge --repo "$MQ_REPO" "$PROOF_BRANCH" --squash --match-head-commit "$PR_HEAD_SHA"
+wait_run merge_group "" "$PR_NUMBER" "$QUEUE_REQUESTED_AT"
 
-if [ "$STATUS" != "completed" ] || [ "$CONCLUSION" != "success" ]; then
-  echo "merge_group $WORKFLOW_NAME did not complete successfully in $MQ_REPO" >&2
-  echo "run_url=${RUN_URL:-none}" >&2
-  exit 1
-fi
+MERGED="false"
+for attempt in $(seq 1 24); do
+  PR_JSON="$(gh pr view --repo "$MQ_REPO" "$PR_NUMBER" --json number,state,headRefOid,mergedAt,mergeCommit)"
+  if printf '%s' "$PR_JSON" | /usr/bin/python3 "$PROOF_SELECTOR" verify-merged --pr "$PR_NUMBER" --head-sha "$PR_HEAD_SHA" --not-before "$QUEUE_REQUESTED_AT" >/dev/null 2>&1; then
+    MERGED="true"
+    break
+  fi
+  sleep 5
+done
+[ "$MERGED" = "true" ] || { echo "exact proof PR was not confirmed merged" >&2; exit 1; }
 
 echo "merge_queue_proof=success"
-echo "repo=$MQ_REPO"
+echo "fixture_repo=$MQ_REPO"
+echo "source_protected_head=$SOURCE_HEAD"
+echo "reviewer=$REVIEWER"
+echo "synthetic_ruleset_id=$RULESET_ID"
 echo "pr_number=$PR_NUMBER"
-echo "pr_url=$PR_URL"
 echo "merge_group_run_url=$RUN_URL"
+echo "merge_group_head_sha=$RUN_SHA"
+echo "fixture_retained_by_explicit_owner_choice=true"

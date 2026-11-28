@@ -3,12 +3,39 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import stat
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import yaml
 from jsonschema import Draft202012Validator
+
+from secure_projection_path import read_repository_file
+
+
+MAX_OBJECT_BYTES = 2 * 1024 * 1024
+MAX_TOTAL_BYTES = 64 * 1024 * 1024
+MAX_OBJECTS = 5000
+MAX_ERRORS = 50
+MAX_TREE_NODES = 100000
+MAX_TREE_DEPTH = 64
+
+
+def check_tree_bound(data: object) -> None:
+    """Bound traversal after YAML alias expansion, including repeated references."""
+    stack = [(data, 0)]
+    count = 0
+    while stack:
+        value, depth = stack.pop()
+        count += 1
+        if count > MAX_TREE_NODES or depth > MAX_TREE_DEPTH:
+            raise ValueError("YAML object exceeds tree size or depth limit")
+        if isinstance(value, dict):
+            stack.extend((child, depth + 1) for child in value.values())
+        elif isinstance(value, list):
+            stack.extend((child, depth + 1) for child in value)
 
 
 ROOT_FAMILIES = {
@@ -42,9 +69,21 @@ def iso_ok(ts: str) -> bool:
         return False
 
 
-def load_yaml(path: Path):
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def load_yaml(path: Path, *, repo_root: Path | None = None):
+    if repo_root is not None:
+        raw = read_repository_file(repo_root, path, limit=MAX_OBJECT_BYTES)
+    else:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_OBJECT_BYTES:
+                raise ValueError("not a bounded regular YAML file")
+            raw = stream.read(MAX_OBJECT_BYTES + 1)
+    if len(raw) > MAX_OBJECT_BYTES:
+        raise ValueError("YAML file exceeds size limit")
+    data = yaml.safe_load(raw)
+    check_tree_bound(data)
+    return data
 
 
 def build_validators(schema_bundle: dict[str, object]):
@@ -75,31 +114,62 @@ def main() -> int:
         print(f"ERROR: missing schema bundle: {schema_path}", file=sys.stderr)
         return 2
 
-    bundle = json.loads(schema_path.read_text(encoding="utf-8"))
+    try:
+        bundle = json.loads(read_repository_file(repo_root, schema_path,
+                                                 limit=MAX_OBJECT_BYTES))
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: unsafe schema bundle: {exc}", file=sys.stderr)
+        return 2
     validators = build_validators(bundle)
 
     errors = []
     warnings = []
     checked = 0
+    total_bytes = 0
+    seen_object_ids: dict[str, str] = {}
 
     for path in iter_object_files(repo_root):
         rel = path.relative_to(repo_root).as_posix()
-        data = load_yaml(path)
+        checked += 1
+        if checked > MAX_OBJECTS:
+            errors.append(f"object count exceeds {MAX_OBJECTS}")
+            break
+        try:
+            total_bytes += path.lstat().st_size
+            if total_bytes > MAX_TOTAL_BYTES:
+                raise ValueError(f"aggregate YAML input exceeds {MAX_TOTAL_BYTES} bytes")
+            data = load_yaml(path, repo_root=repo_root)
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            errors.append(f"{rel}: {exc}")
+            if len(errors) >= MAX_ERRORS:
+                break
+            continue
 
         if not isinstance(data, dict) or "kind" not in data:
             continue
 
         kind = data["kind"]
-        checked += 1
 
-        if kind not in validators:
-            errors.append(f"{rel}: unknown kind {kind}")
+        object_id = data.get("metadata", {}).get("object_id")
+        if isinstance(object_id, str) and object_id:
+            previous = seen_object_ids.get(object_id)
+            if previous is not None:
+                errors.append(f"{rel}: duplicate object_id {object_id} (first at {previous})")
+            else:
+                seen_object_ids[object_id] = rel
+
+        if not isinstance(kind, str) or kind not in validators:
+            errors.append(f"{rel}: unknown kind {str(kind)[:200]}")
             continue
 
         validator = validators[kind]
         for err in validator.iter_errors(data):
             loc = ".".join(str(x) for x in err.absolute_path) or "<root>"
-            errors.append(f"{rel}: schema error at {loc}: {err.message}")
+            errors.append(f"{rel}: schema error at {loc[:200]}: {err.message[:400]}")
+            if len(errors) >= MAX_ERRORS:
+                break
+        if len(errors) >= MAX_ERRORS:
+            break
 
         expected = ROOT_FAMILIES.get(kind)
         if expected:
@@ -113,7 +183,7 @@ def main() -> int:
         try:
             canonical_home = data["attributes"]["identity"]["canonical_home"]
             if canonical_home != rel:
-                errors.append(f"{rel}: canonical_home mismatch ({canonical_home})")
+                errors.append(f"{rel}: canonical_home mismatch ({str(canonical_home)[:200]})")
         except Exception:
             errors.append(f"{rel}: missing attributes.identity.canonical_home")
 
@@ -132,10 +202,12 @@ def main() -> int:
             "PRIME_CANON_CANDIDATE_CLAIM_V1",
             "PRIME_CANON_SOURCE_UNIT_V1",
         }:
-            warnings.append(f"{rel}: promotion lane usually should not hold raw candidates or source units")
+            if len(warnings) < MAX_ERRORS:
+                warnings.append(f"{rel}: promotion lane usually should not hold raw candidates or source units")
 
         if rel.startswith("receipts/immutable/") and not kind.endswith(("DECISION_V1", "RECEIPT_V1", "PACKET_V1")):
-            warnings.append(f"{rel}: immutable receipts directory usually stores receipt/decision/packet kinds only")
+            if len(warnings) < MAX_ERRORS:
+                warnings.append(f"{rel}: immutable receipts directory usually stores receipt/decision/packet kinds only")
 
     print(f"Validated {checked} object files.")
     if warnings:
@@ -147,6 +219,8 @@ def main() -> int:
         print("\nErrors:")
         for e in errors:
             print(f"  - {e}")
+        if len(errors) >= MAX_ERRORS:
+            print(f"  - stopped after {MAX_ERRORS} errors")
         return 1
 
     print("All prime canon objects passed schema and path validation.")

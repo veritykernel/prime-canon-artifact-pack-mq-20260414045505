@@ -9,6 +9,9 @@ from pathlib import Path
 
 import yaml
 
+from secure_projection_path import (ensure_repository_directory, read_repository_file,
+                                    replace_repository_file, write_repository_file)
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -56,6 +59,8 @@ def extraction_confidence_for(unit: dict) -> float:
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
+        raise SystemExit("invalid subject slug")
 
     source_dir = repo / "canon" / "source_units" / subject_slug
     claim_dir = repo / "canon" / "candidate_claims" / subject_slug
@@ -66,7 +71,7 @@ def main() -> None:
     if not corpus_index_path.exists():
         raise SystemExit(f"missing corpus index: {corpus_index_path}")
 
-    claim_dir.mkdir(parents=True, exist_ok=True)
+    ensure_repository_directory(repo, claim_dir)
 
     source_files = sorted(
         p for p in source_dir.glob("unit-*.yaml")
@@ -75,15 +80,18 @@ def main() -> None:
     if not source_files:
         raise SystemExit(f"no source unit files found in {source_dir}")
 
-    corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
+    corpus_raw = read_repository_file(repo, corpus_index_path)
+    corpus = yaml.safe_load(corpus_raw)
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
 
     generated_ids = []
     for src_path in source_files:
-        unit = yaml.safe_load(src_path.read_text(encoding="utf-8"))
+        unit = yaml.safe_load(read_repository_file(repo, src_path))
         unit_id = unit["spec"]["source_unit_id"]
         seq = src_path.stem.replace("unit-", "")
+        if not re.fullmatch(r"\d{4}", seq):
+            raise SystemExit(f"invalid source unit filename: {src_path.name}")
         normalized_text = unit["spec"]["normalized_text"].strip()
         locator = unit["spec"]["span_ref"]["locator"]
 
@@ -181,14 +189,15 @@ def main() -> None:
         }
 
         out_path = repo / rel_path
-        out_path.write_text(yaml.safe_dump(claim, sort_keys=False), encoding="utf-8")
+        write_repository_file(repo, out_path, yaml.safe_dump(claim, sort_keys=False).encode("utf-8"))
         generated_ids.append(claim_id)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "admissibility"
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_repository_file(repo, corpus_index_path, corpus_raw,
+                            yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
 
     print(f"generated {len(generated_ids)} candidate claims for {subject_slug}")
     for claim_id in generated_ids:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,12 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
+from render_binding import POLICY_PATHS, compute_view_hash, object_index, safe_bytes
+from immutable_receipt import assert_new, write_new
+from secure_projection_path import (read_repository_file, replace_repository_file,
+                                    write_rendered as secure_write_rendered)
+from render_text import compose_rendered_text
+from validate_pack import check_tree_bound
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
 PLAN_KIND = "PRIME_CANON_RENDER_PLAN_V1"
@@ -20,20 +27,35 @@ NODE_KIND = "PRIME_CANON_NODE_V1"
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+MAX_RENDER_BYTES = 16 * 1024 * 1024
 
-def sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def load_yaml(path: Path):
-    if not path.exists():
-        raise SystemExit(f"missing yaml: {path}")
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+def write_rendered(repo: Path, path: Path, rendered_text: str) -> str:
+    raw = rendered_text.encode("utf-8")
+    if len(raw) > MAX_RENDER_BYTES:
+        raise SystemExit("rendered output exceeds size limit")
+    if path != repo / "views" / "rendered" / path.name:
+        raise SystemExit("rendered output path is outside the repository render directory")
+    secure_write_rendered(repo, path.stem, raw)
+    return hashlib.sha256(raw).hexdigest()
+
+def load_yaml(repo: Path, path: Path) -> tuple[dict, bytes]:
+    raw = read_repository_file(repo, path)
+    obj = yaml.safe_load(raw)
+    check_tree_bound(obj)
+    if not isinstance(obj, dict):
+        raise ValueError(f"render object is not a mapping: {path}")
+    return obj, raw
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    generation = sys.argv[3] if len(sys.argv) > 3 else "default"
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
+        raise SystemExit("invalid subject slug")
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", generation):
+        raise SystemExit("invalid render generation")
+    suffix = "" if generation == "default" else f"-{generation}"
 
     corpus_index_path = repo / "canon" / "corpora" / subject_slug / "index.yaml"
     view_path = repo / "views" / "current" / f"{subject_slug}.yaml"
@@ -55,22 +77,28 @@ def main() -> None:
     if not receipt_dir.exists():
         raise SystemExit(f"missing receipt dir: {receipt_dir}")
 
-    rendered_path.parent.mkdir(parents=True, exist_ok=True)
+    # Refuse a rerun before changing nodes, the view, or rendered output.
+    execution_path = receipt_dir / f"render-execution{suffix}.yaml"
+    drift_path = receipt_dir / f"render-drift{suffix}.yaml"
+    assert_new(repo, execution_path)
+    assert_new(repo, drift_path)
 
-    corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
-    view = yaml.safe_load(view_path.read_text(encoding="utf-8"))
-    profile_cfg = load_yaml(profile_cfg_path)
-    order_cfg = load_yaml(order_cfg_path)
-    targets_cfg = load_yaml(targets_cfg_path)
-    redaction_cfg = load_yaml(redaction_cfg_path)
+    snapshot = object_index(repo)
+    policy_snapshot = {relative: safe_bytes(repo, relative) for relative in POLICY_PATHS}
+    corpus, corpus_raw = load_yaml(repo, corpus_index_path)
+    view, view_raw = load_yaml(repo, view_path)
+    profile_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[0]])
+    order_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[1]])
+    targets_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[2]])
+    redaction_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[3]])
 
     corpus_id = corpus["spec"]["corpus_id"]
     view_id = view["spec"]["view_id"]
     now = utc_now()
     rendered_rel_path = f"views/rendered/{subject_slug}.md"
-    execution_receipt_id = f"pc.render_execution_receipt.{subject_slug}.default"
-    drift_receipt_id = f"pc.render_drift_receipt.{subject_slug}.default"
-    plan_id = f"pc.render_plan.{subject_slug}.default"
+    execution_receipt_id = f"pc.render_execution_receipt.{subject_slug}.{generation}"
+    drift_receipt_id = f"pc.render_drift_receipt.{subject_slug}.{generation}"
+    plan_id = f"pc.render_plan.{subject_slug}.{generation}"
 
     default_output_format = str(profile_cfg["default_output_format"])
     target_projection_flag = str(profile_cfg["target_projection_flag"])
@@ -89,6 +117,8 @@ def main() -> None:
 
     if target_projection_flag not in allowed_projection_flags:
         raise SystemExit(f"target_projection_flag {target_projection_flag} not allowed by render-targets")
+    if target_projection_flag not in default_projection_flags:
+        raise SystemExit(f"target_projection_flag {target_projection_flag} is not enabled by default render targets")
     if default_output_format not in allowed_output_formats:
         raise SystemExit(f"default_output_format {default_output_format} not allowed by render-targets")
     if str(order_cfg["ordering_mode"]) != "active_node_refs":
@@ -269,85 +299,28 @@ def main() -> None:
     for node_id in node_ids:
         seq = node_id.rsplit(".", 1)[-1]
         node_path = node_dir / f"node-{seq}.yaml"
-        if not node_path.exists():
-            raise SystemExit(f"missing node file for {node_id}: {node_path}")
-        node = yaml.safe_load(node_path.read_text(encoding="utf-8"))
+        if node_id not in snapshot:
+            raise SystemExit(f"missing node snapshot for {node_id}: {node_path}")
+        relative, _, node = snapshot[node_id]
+        if relative != f"canon/nodes/{subject_slug}/node-{seq}.yaml":
+            raise SystemExit(f"node ID/path mismatch: {node_id}")
 
-        flags = list(node["spec"].get("active_projection_flags", []))
-        for item in default_projection_flags:
-            if item == target_projection_flag and item not in flags:
-                flags.append(item)
-        if "machine_readable" not in flags:
-            flags.insert(0, "machine_readable")
-
-        ordered = []
-        for item in ["machine_readable", "rendered_text", "exportable"]:
-            if item in flags and item not in ordered:
-                ordered.append(item)
-
-        node["spec"]["active_projection_flags"] = ordered
-        node["metadata"]["updated_at"] = now
-        node["attributes"]["temporal"]["reduced_at"] = now
-        node["attributes"]["temporal"]["status_since"] = now
-
+        # Rendering is a projection of an existing promoted node. It must not
+        # rewrite the promoted source object as a side effect.
         ensure_required_fields(repo, NODE_KIND, node["spec"])
         validate_instance(repo, node)
-        node_path.write_text(yaml.safe_dump(node, sort_keys=False), encoding="utf-8")
 
         node_objects.append(node)
         all_source_refs.extend(node["attributes"]["lineage"].get("source_refs", []))
         all_source_unit_refs.extend(node["attributes"]["lineage"].get("source_unit_refs", []))
 
-    lines = []
-    title = f"{subject_slug} rendered canon"
-    if heading_style == "title_only":
-        lines.append(f"# {title}")
-    else:
-        lines.append(f"# {title}")
-    lines.append("")
+    rendered_text = compose_rendered_text(
+        subject_slug, corpus_id, view_id, now, node_objects,
+        {POLICY_PATHS[0]: profile_cfg, POLICY_PATHS[1]: order_cfg,
+         POLICY_PATHS[2]: targets_cfg, POLICY_PATHS[3]: redaction_cfg}, generation)
+    output_sha256 = write_rendered(repo, rendered_path, rendered_text)
 
-    metadata_map = {
-        "corpus_id": corpus_id,
-        "current_state_view": view_id,
-        "generated_at": now,
-    }
-
-    for field in include_metadata_fields:
-        if field in metadata_map:
-            lines.append(f"- {field}: `{metadata_map[field]}`")
-    lines.append(f"- active_node_count: `{len(node_objects)}`")
-    lines.append("")
-
-    lines.append("## Promoted canon nodes")
-    lines.append("")
-
-    if section_strategy != "linear_nodes":
-        raise SystemExit(f"unsupported section_strategy in first cycle-2 render refactor: {section_strategy}")
-    if ordering_strategy != "active_node_order":
-        raise SystemExit(f"unsupported ordering_strategy in first cycle-2 render refactor: {ordering_strategy}")
-
-    for idx, node in enumerate(node_objects, start=1):
-        if heading_style == "numbered":
-            lines.append(f"{idx}. {node['spec']['canonical_body']}")
-        else:
-            lines.append(f"- {node['spec']['canonical_body']}")
-
-    if include_receipt_footer:
-        lines.append("")
-        lines.append("## Projection receipts")
-        lines.append("")
-        lines.append(f"- render_profile_ref: `{render_profile['spec']['profile_id']}`")
-        lines.append(f"- render_plan_ref: `{plan_id}`")
-
-    rendered_text = "\n".join(lines) + "\n"
-    rendered_path.write_text(rendered_text, encoding="utf-8")
-    output_sha256 = sha256_file(rendered_path)
-
-    prior_receipts = [
-        ref for ref in view["spec"].get("derivation_receipt_refs", [])
-        if not ref.endswith(".rendered-projection")
-        and not ref.endswith(".default")
-    ]
+    prior_receipts = list(view["spec"].get("derivation_receipt_refs", []))
 
     execution_receipt = {
         "kind": EXEC_KIND,
@@ -365,7 +338,7 @@ def main() -> None:
             "identity": {
                 "corpus_id": corpus_id,
                 "subject_slug": subject_slug,
-                "canonical_home": f"receipts/immutable/{subject_slug}/render-execution.yaml",
+                "canonical_home": str(execution_path.relative_to(repo)),
             },
             "lineage": {
                 "source_refs": sorted(set(all_source_refs)),
@@ -396,7 +369,7 @@ def main() -> None:
             },
             "operational": {
                 "lane_ref": "rendered-projection",
-                "repo_home": f"receipts/immutable/{subject_slug}/render-execution.yaml",
+                "repo_home": str(execution_path.relative_to(repo)),
                 "active_state": "active",
                 "mirror_permissions": "local_only",
                 "route_destination": "export-prep",
@@ -435,19 +408,11 @@ def main() -> None:
     view["spec"]["rendered_projection_refs"] = [rendered_rel_path]
     view["spec"]["derivation_receipt_refs"] = prior_receipts + [execution_receipt_id, drift_receipt_id]
     view["spec"]["generated_at"] = now
-    view["spec"]["view_hash"] = sha256_text(
-        "|".join(
-            node_ids
-            + list(view["spec"].get("active_edge_refs", []))
-            + list(view["spec"].get("active_contradiction_refs", []))
-            + list(view["spec"].get("unresolved_blocker_refs", []))
-            + [rendered_rel_path, execution_receipt_id, drift_receipt_id, corpus_id, now]
-        )
-    )
+    view["spec"]["view_hash"] = compute_view_hash(
+        repo, subject_slug, view, snapshot=snapshot, policy_bytes=policy_snapshot)
 
     ensure_required_fields(repo, VIEW_KIND, view["spec"])
     validate_instance(repo, view)
-    view_path.write_text(yaml.safe_dump(view, sort_keys=False), encoding="utf-8")
 
     current_view_hash = view["spec"]["view_hash"]
 
@@ -467,7 +432,7 @@ def main() -> None:
             "identity": {
                 "corpus_id": corpus_id,
                 "subject_slug": subject_slug,
-                "canonical_home": f"receipts/immutable/{subject_slug}/render-drift.yaml",
+                "canonical_home": str(drift_path.relative_to(repo)),
             },
             "lineage": {
                 "source_refs": sorted(set(all_source_refs)),
@@ -498,7 +463,7 @@ def main() -> None:
             },
             "operational": {
                 "lane_ref": "rendered-projection",
-                "repo_home": f"receipts/immutable/{subject_slug}/render-drift.yaml",
+                "repo_home": str(drift_path.relative_to(repo)),
                 "active_state": "active",
                 "mirror_permissions": "local_only",
                 "route_destination": "export-prep",
@@ -528,14 +493,19 @@ def main() -> None:
     ensure_required_fields(repo, DRIFT_KIND, drift_receipt["spec"])
     validate_instance(repo, drift_receipt)
 
-    (repo / execution_receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(execution_receipt, sort_keys=False), encoding="utf-8")
-    (repo / drift_receipt["attributes"]["identity"]["canonical_home"]).write_text(yaml.safe_dump(drift_receipt, sort_keys=False), encoding="utf-8")
+    write_new(repo, execution_path, execution_receipt)
+    write_new(repo, drift_path, drift_receipt)
 
     corpus["metadata"]["updated_at"] = now
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "export-prep"
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_repository_file(repo, corpus_index_path, corpus_raw,
+                            yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
+    # The current view is the publication switch; update it only after the
+    # receipts and corpus route have been written successfully.
+    replace_repository_file(repo, view_path, view_raw,
+                            yaml.safe_dump(view, sort_keys=False).encode("utf-8"))
 
     print(render_profile["spec"]["profile_id"])
     print(plan_id)

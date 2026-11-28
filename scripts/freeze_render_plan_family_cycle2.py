@@ -5,6 +5,8 @@ import copy
 import json
 from pathlib import Path
 
+from secure_projection_path import read_repository_file, replace_repository_file
+
 RENDER_PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
 RENDER_PLAN_KIND = "PRIME_CANON_RENDER_PLAN_V1"
 RENDER_EXECUTION_RECEIPT_KIND = "PRIME_CANON_RENDER_EXECUTION_RECEIPT_V1"
@@ -56,8 +58,10 @@ def clone_with_new_spec(defs: dict, base_kind: str, new_kind: str, description: 
     return schema
 
 def main() -> None:
-    bundle_path = Path("schemas/prime-canon-bundle.schema.json")
-    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    repo = Path.cwd().resolve(strict=True)
+    bundle_path = repo / "schemas/prime-canon-bundle.schema.json"
+    bundle_raw = read_repository_file(repo, bundle_path)
+    bundle = json.loads(bundle_raw)
     defs = bundle["$defs"]
 
     render_profile_spec = {
@@ -204,7 +208,8 @@ def main() -> None:
         ],
     )
 
-    bundle_path.write_text(json.dumps(bundle, indent=2) + "\n", encoding="utf-8")
+    replace_repository_file(repo, bundle_path, bundle_raw,
+                            (json.dumps(bundle, indent=2) + "\n").encode("utf-8"))
     print("added defs:")
     print(RENDER_PROFILE_KIND)
     print(RENDER_PLAN_KIND)

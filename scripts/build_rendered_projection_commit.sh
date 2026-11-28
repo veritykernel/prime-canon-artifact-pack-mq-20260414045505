@@ -10,6 +10,7 @@ if [ ! -x .venv/bin/python3 ]; then
 fi
 source .venv/bin/activate
 SUBJECT_SLUG="${1:-subject-0001}"
+GENERATION="${2:-default}"
 if [ ! -f "views/current/$SUBJECT_SLUG.yaml" ]; then
   echo "missing current state view for $SUBJECT_SLUG" >&2
   exit 1
@@ -30,8 +31,7 @@ do
     exit 1
   fi
 done
-rm -f "receipts/immutable/$SUBJECT_SLUG/rendered-projection-summary.yaml"
-python3 scripts/build_rendered_projection.py "$REPO" "$SUBJECT_SLUG"
+python3 scripts/build_rendered_projection.py "$REPO" "$SUBJECT_SLUG" "$GENERATION"
 python3 scripts/validate_pack.py .
 git diff --exit-code -- control schemas
 rm -rf scripts/__pycache__

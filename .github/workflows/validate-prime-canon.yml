@@ -2,6 +2,8 @@ name: validate-prime-canon
 
 on:
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     paths:
       - "canon/**"
@@ -10,19 +12,30 @@ on:
       - "replay/**"
       - "views/**"
       - "schemas/**"
-      - "scripts/validate_pack.py"
+      - "scripts/**"
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - name: Install validator deps
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install pyyaml jsonschema
+          python -m pip install -r requirements.txt
+      - name: Preserve immutable receipt and current-view history
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            BASE_SHA="$(git rev-parse "$GITHUB_SHA^")"
+          fi
+          python scripts/check_immutable_history.py "$BASE_SHA" "$GITHUB_SHA"
       - name: Validate prime canon pack
         run: python scripts/validate_pack.py .
+      - name: Test promotion gates
+        run: python -m unittest discover -s scripts/tests -v
