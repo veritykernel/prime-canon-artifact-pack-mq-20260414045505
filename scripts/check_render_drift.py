@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import stat
 import sys
 from pathlib import Path
 
@@ -14,9 +12,8 @@ import yaml
 
 from render_binding import compute_view_hash
 from render_receipts import active_receipt_paths
+from secure_projection_path import read_rendered
 from validate_pack import load_yaml as load_bounded_yaml
-
-MAX_RENDER_BYTES = 16 * 1024 * 1024
 
 
 def load_yaml(path: Path) -> dict:
@@ -25,18 +22,11 @@ def load_yaml(path: Path) -> dict:
     return load_bounded_yaml(path)
 
 
-def current_output_hash(path: Path) -> str | None:
+def current_output_hash(repo: Path, subject_slug: str) -> str | None:
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        raw = read_rendered(repo, subject_slug)
     except FileNotFoundError:
         return None
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RENDER_BYTES:
-            raise ValueError("rendered output is not a bounded regular file")
-        raw = stream.read(MAX_RENDER_BYTES + 1)
-    if len(raw) > MAX_RENDER_BYTES:
-        raise ValueError("rendered output exceeds size limit")
     return hashlib.sha256(raw).hexdigest()
 
 
@@ -50,7 +40,7 @@ def inspect(repo: Path, subject_slug: str) -> tuple[str, str]:
     drift = load_yaml(drift_path)
     view_spec, execution_spec, drift_spec = view["spec"], execution["spec"], drift["spec"]
     expected_ref = f"views/rendered/{subject_slug}.md"
-    output_sha = current_output_hash(repo / expected_ref)
+    output_sha = current_output_hash(repo, subject_slug)
     current_view_hash = compute_view_hash(repo, subject_slug, view)
 
     if output_sha is None:

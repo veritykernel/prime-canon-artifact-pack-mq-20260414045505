@@ -14,9 +14,12 @@ authorize later changed bytes.
 The repository target must equal the approved /Users/Shared/nuum-work/stage
 subject filename; a repository edit cannot select another host directory.
 
-The current view binds its complete spec, the exact bytes of each active canon
-node, and the four render policy files into `view_hash`. Export prep and the
-publisher recompute that hash on every use. `check_render_drift.py` is read-only:
+The current view binds its complete spec, the exact bytes of referenced active
+nodes, supersession edges, contradictions, unresolved blockers, prior derivation
+receipts, and the four render policy files into the v3 `view_hash`. The active
+render execution and drift receipts contain that hash, so their exact IDs are
+bound in the spec and their bytes are checked separately. Export prep and the
+publisher recompute the content root on every use. `check_render_drift.py` is read-only:
 it reports stale inputs without changing an immutable receipt or the view.
 The render builder also leaves promoted node bytes unchanged.
 
@@ -29,17 +32,19 @@ Use a new generation label for each later render. The validator and CI history
 check reject updates or removal of previously committed immutable receipts,
 promoted nodes, and reviewed source units.
 
-The publish-guard-check workflow checks a candidate checkout with the policy
-from default branch main. Its policy pins the exact approved publisher,
-verified-copy helper, and guard entrypoint bytes. Changing one of those
-entrypoints requires a separate reviewed policy update before the candidate
-can pass. CODEOWNERS assigns workflows, scripts, and CODEOWNERS itself to
-the VK maintainer. The hosted main ruleset must require code-owner review and
-the publish-guard-check and validate contexts for this source policy to be
-enforced at merge. A green source workflow alone does not establish that
-hosted ruleset.
+The publish-guard-check workflow checks a candidate checkout with policy from
+default branch main. The additional `publish-guard-trusted` job runs only code
+from the protected base checkout and compares enforcement files and prior
+immutable receipts, nodes, and source units with the candidate. It never
+executes candidate code. CODEOWNERS assigns workflows, scripts, and CODEOWNERS
+to the VK maintainer. After this source change merges, observe the trusted job
+on an exact PR head and add its app-bound context to the hosted ruleset. The
+existing `publish-guard-check` and `validate` contexts, strictness, code-owner
+review, last-push review, and no-bypass setting remain required.
 
-The merge-queue proof script accepts only a clean source checkout and a private
-proof repository. It requires a distinct reviewer, then binds its final result
-to the exact proof PR and merge-group run. It has external GitHub effects and
-is not part of ordinary validation or publication.
+The merge-queue proof script accepts only an explicitly selected, empty private
+`veritykernel` fixture with the exact proof marker and owner retention choice.
+It creates a synthetic workflow there and never pushes this repository's source
+commit. Its run selector binds the result to the exact proof PR and merge-group
+run. This script has external GitHub effects and is not part of ordinary
+validation or publication.

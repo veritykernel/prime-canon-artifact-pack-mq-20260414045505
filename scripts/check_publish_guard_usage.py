@@ -16,7 +16,7 @@ MAX_SCRIPT_BYTES = 2 * 1024 * 1024
 PINNED_ENTRYPOINTS = {
     "scripts/publish_guard.sh": "c93286b85edba3366078814bbe6bfe7bd3c2dc586f16e55e2085f9152b2c9da8",
     "scripts/publish_rendered_subject.sh": "7ba0bc959f448bad6a5bc72ba8c519b3fa05e960230832884a8a173e8cff1570",
-    "scripts/publish_verified_subject.py": "598f1bdf2f61e24a135d490f9029c5ba200bd2a77b1a7380fc544baa6316b6f8",
+    "scripts/publish_verified_subject.py": "dfab31d83f966f137389777f20fb55e9fb531f2119cf881c382fc36436a9360e",
 }
 PUBLISH_PATTERNS = (
     r"\b(?:cp|rsync|mv|scp)\s+[^\n]*(?:views/rendered|rendered\.md|\$SRC_PATH)",

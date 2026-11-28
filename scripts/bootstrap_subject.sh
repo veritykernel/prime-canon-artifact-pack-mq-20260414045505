@@ -22,6 +22,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 import os
 import re
+import stat
 import yaml
 
 repo = Path(".").resolve()
@@ -70,11 +71,29 @@ def checked_directory(rel: str) -> Path:
         raise SystemExit(f"Bootstrap destination escapes repository: {path}")
     return path
 
+def write_exclusive(path: Path, payload: bytes) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+index_target = repo / f"canon/corpora/{subject_slug}/index.yaml"
+render_target = repo / f"views/rendered/{subject_slug}.md"
+for target in (index_target, render_target):
+    checked_directory(target.parent.relative_to(repo).as_posix())
+    if target.exists() or target.is_symlink():
+        raise SystemExit(f"bootstrap destination already exists; reconcile first: {target}")
+
 for rel in runtime_dirs:
     path = checked_directory(rel)
     path.mkdir(parents=True, exist_ok=True)
     if not rel.startswith("canon/corpora/"):
-        (path / ".gitkeep").touch()
+        gitkeep = path / ".gitkeep"
+        if not gitkeep.exists() and not gitkeep.is_symlink():
+            write_exclusive(gitkeep, b"")
+        elif gitkeep.is_symlink() or not stat.S_ISREG(gitkeep.lstat().st_mode):
+            raise SystemExit(f"unsafe bootstrap placeholder: {gitkeep}")
 
 checked_directory("views/rendered").mkdir(parents=True, exist_ok=True)
 
@@ -140,12 +159,8 @@ data["spec"]["source_count"] = len(source_refs)
 data["spec"]["intake_scope"] = intake_scope
 data["spec"]["status"] = "open"
 
-out = repo / f"canon/corpora/{subject_slug}/index.yaml"
-out.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+write_exclusive(index_target, yaml.safe_dump(data, sort_keys=False).encode("utf-8"))
 
-(repo / f"views/rendered/{subject_slug}.md").write_text(
-    f"# {subject_title}\n\nPending first promotion.\n",
-    encoding="utf-8",
-)
+write_exclusive(render_target, f"# {subject_title}\n\nPending first promotion.\n".encode("utf-8"))
 PY
 python3 scripts/validate_pack.py .

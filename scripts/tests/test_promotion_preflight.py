@@ -218,7 +218,7 @@ class VerifiedPublicationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.repo = self.root / "repo"
-        for directory in ("control", "receipts", "views"):
+        for directory in ("control", "receipts", "replay", "views"):
             shutil.copytree(SOURCE / directory, self.repo / directory)
         (self.repo / "canon").mkdir()
         shutil.copytree(SOURCE / "canon" / "nodes", self.repo / "canon" / "nodes")
@@ -233,6 +233,7 @@ class VerifiedPublicationTests(unittest.TestCase):
         drift_path.write_text(yaml.safe_dump(drift, sort_keys=False))
         self.stage = self.root / "stage"
         self.stage.mkdir()
+        self.stage = self.stage.resolve()
         self.target = self.stage / f"{SUBJECT}.rendered.md"
         cfg_path = self.repo / "control" / "publish" / "publish-targets.default.yaml"
         cfg = yaml.safe_load(cfg_path.read_text())
@@ -255,7 +256,7 @@ class VerifiedPublicationTests(unittest.TestCase):
         protected = self.root / "operator-file"
         protected.write_text("keep")
         self.target.symlink_to(protected)
-        with self.assertRaisesRegex(PromotionRejected, "target is a symlink"):
+        with self.assertRaisesRegex(PromotionRejected, "output target is not a regular file"):
             publish(self.repo, SUBJECT, approved_root=self.stage)
         self.assertEqual(protected.read_text(), "keep")
 
@@ -272,6 +273,13 @@ class VerifiedPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(PromotionRejected, "render receipts and current view"):
             publish(self.repo, SUBJECT, approved_root=self.stage)
 
+    def test_changed_prior_derivation_receipt_blocks_publication(self):
+        receipt = self.repo / "receipts" / "immutable" / SUBJECT / "promotion-readiness-packet.yaml"
+        receipt.write_text(receipt.read_text() + "\n# post-render edit\n")
+        self.assertEqual(inspect(self.repo, SUBJECT)[1], "stale_view")
+        with self.assertRaisesRegex(PromotionRejected, "render receipts and current view"):
+            publish(self.repo, SUBJECT, approved_root=self.stage)
+
     def test_repository_cannot_redirect_publication_to_another_absolute_path(self):
         outside = self.root / "outside"
         outside.mkdir()
@@ -281,7 +289,7 @@ class VerifiedPublicationTests(unittest.TestCase):
         cfg = yaml.safe_load(cfg_path.read_text())
         cfg["subjects"][SUBJECT]["rendered_markdown_path"] = str(protected)
         cfg_path.write_text(yaml.safe_dump(cfg))
-        with self.assertRaisesRegex(PromotionRejected, "differs from the approved stage"):
+        with self.assertRaisesRegex(PromotionRejected, "publish target must be inside the trusted stage root"):
             publish(self.repo, SUBJECT, approved_root=self.stage)
         self.assertEqual(protected.read_text(), "keep")
 

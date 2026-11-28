@@ -68,7 +68,7 @@ def iso_ok(ts: str) -> bool:
 
 
 def load_yaml(path: Path):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_OBJECT_BYTES:
@@ -119,6 +119,7 @@ def main() -> int:
     warnings = []
     checked = 0
     total_bytes = 0
+    seen_object_ids: dict[str, str] = {}
 
     for path in iter_object_files(repo_root):
         rel = path.relative_to(repo_root).as_posix()
@@ -141,6 +142,14 @@ def main() -> int:
             continue
 
         kind = data["kind"]
+
+        object_id = data.get("metadata", {}).get("object_id")
+        if isinstance(object_id, str) and object_id:
+            previous = seen_object_ids.get(object_id)
+            if previous is not None:
+                errors.append(f"{rel}: duplicate object_id {object_id} (first at {previous})")
+            else:
+                seen_object_ids[object_id] = rel
 
         if not isinstance(kind, str) or kind not in validators:
             errors.append(f"{rel}: unknown kind {str(kind)[:200]}")

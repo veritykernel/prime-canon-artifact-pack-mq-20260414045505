@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -27,7 +28,7 @@ class ResidualGuardTests(unittest.TestCase):
         self.repo.mkdir()
 
     def stage_pack(self):
-        for directory in ("canon", "receipts", "views", "control", "schemas"):
+        for directory in ("canon", "receipts", "replay", "views", "control", "schemas"):
             shutil.copytree(SOURCE / directory, self.repo / directory)
 
     def test_immutable_writer_preserves_existing_receipt(self):
@@ -83,6 +84,7 @@ class ResidualGuardTests(unittest.TestCase):
         self.assertEqual(inspect(self.repo, SUBJECT)[1], "in_sync")
         stage = self.root / "stage"
         stage.mkdir()
+        stage = stage.resolve()
         target = stage / f"{SUBJECT}.rendered.md"
         cfg_path = self.repo / "control" / "publish" / "publish-targets.default.yaml"
         cfg = yaml.safe_load(cfg_path.read_text())
@@ -104,9 +106,22 @@ class ResidualGuardTests(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("symlink or non-regular", result.stderr)
+        self.assertIn("output target is not a regular file", result.stderr)
         self.assertEqual(outside.read_text(), "keep")
         self.assertFalse((self.repo / "receipts" / "immutable" / SUBJECT / "render-execution-v2.yaml").exists())
+
+    def test_fifo_render_input_fails_without_waiting_for_a_writer(self):
+        self.stage_pack()
+        rendered = self.repo / "views" / "rendered" / f"{SUBJECT}.md"
+        rendered.unlink()
+        os.mkfifo(rendered)
+        result = subprocess.run(
+            [sys.executable, str(SOURCE / "scripts" / "check_render_drift.py"),
+             str(self.repo), SUBJECT],
+            capture_output=True, text=True, timeout=3,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("bounded regular file", result.stderr)
 
     def test_validator_rejects_oversized_yaml(self):
         path = self.repo / "oversized.yaml"
@@ -127,6 +142,26 @@ class ResidualGuardTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("already exists", result.stderr)
         self.assertEqual((unit.read_bytes(), corpus.read_bytes()), original)
+
+    def test_new_source_unit_starts_unscored_and_preserves_prior_lineage(self):
+        self.stage_pack()
+        tsv = self.root / "new-source.tsv"
+        tsv.write_text(
+            "seq\tsource_ref\tlocator\tstart\tend\tobserved_at\tscope\tnormalized_text\n"
+            "6\tchat://new-source\tline-1\t0\t4\t2026-04-13T00:00:00Z\tproof\ttest\n"
+        )
+        corpus = self.repo / "canon" / "corpora" / SUBJECT / "index.yaml"
+        old_ids = yaml.safe_load(corpus.read_text())["attributes"]["lineage"]["source_unit_refs"]
+        result = subprocess.run(
+            [sys.executable, str(SOURCE / "scripts" / "enroll_source_units.py"),
+             str(self.repo), SUBJECT, str(tsv)], capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        unit = yaml.safe_load((self.repo / "canon" / "source_units" / SUBJECT / "unit-0006.yaml").read_text())
+        self.assertEqual(unit["attributes"]["evidence"]["sufficiency_status"], "unscored")
+        self.assertEqual(unit["attributes"]["evidence"]["evidence_class"], "human_assertion")
+        new_ids = yaml.safe_load(corpus.read_text())["attributes"]["lineage"]["source_unit_refs"]
+        self.assertEqual(new_ids[:-1], old_ids)
 
     def test_history_gate_rejects_changed_receipt(self):
         subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
@@ -165,6 +200,33 @@ class ResidualGuardTests(unittest.TestCase):
         self.assertIn("SUBJECT_SLUG", result.stderr)
         self.assertFalse(outside.exists())
 
-
+    def test_bootstrap_rejects_linked_index_and_render_leaves(self):
+        for leaf in ("index", "render"):
+            with self.subTest(leaf=leaf):
+                bootstrap = self.root / f"bootstrap-{leaf}"
+                shutil.copytree(SOURCE / "scripts", bootstrap / "scripts",
+                                ignore=shutil.ignore_patterns("__pycache__"))
+                shutil.copytree(SOURCE / "canon", bootstrap / "canon")
+                (bootstrap / "views" / "rendered").mkdir(parents=True)
+                venv_bin = bootstrap / ".venv" / "bin"
+                venv_bin.mkdir(parents=True)
+                (venv_bin / "python3").symlink_to(sys.executable)
+                (venv_bin / "activate").write_text(
+                    f'export PATH="{Path(sys.executable).parent}:$PATH"\n')
+                sentinel = self.root / f"outside-{leaf}.txt"
+                sentinel.write_text("KEEP")
+                index = bootstrap / "canon" / "corpora" / "new-subject" / "index.yaml"
+                rendered = bootstrap / "views" / "rendered" / "new-subject.md"
+                target = index if leaf == "index" else rendered
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(sentinel)
+                result = subprocess.run(
+                    ["bash", str(bootstrap / "scripts" / "bootstrap_subject.sh"), "new-subject"],
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("bootstrap destination already exists", result.stderr)
+                self.assertEqual(sentinel.read_text(), "KEEP")
+                self.assertFalse((rendered if leaf == "index" else index).exists())
 if __name__ == "__main__":
     unittest.main()

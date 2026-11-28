@@ -33,7 +33,7 @@ def _bytes(repo: Path, path: Path) -> bytes:
         raise PromotionRejected(f"path escapes repository: {path}")
     if path.is_symlink():
         raise PromotionRejected(f"symlink input: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK
     try:
         fd = os.open(path, flags)
     except OSError as exc:

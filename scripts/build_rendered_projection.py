@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import re
-import secrets
-import stat
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,8 +10,9 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
-from render_binding import compute_view_hash
+from render_binding import POLICY_PATHS, compute_view_hash, object_index, safe_bytes
 from immutable_receipt import assert_new, write_new
+from secure_projection_path import write_rendered as secure_write_rendered
 from validate_pack import load_yaml as load_bounded_yaml
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
@@ -34,33 +32,9 @@ def write_rendered(repo: Path, path: Path, rendered_text: str) -> str:
     raw = rendered_text.encode("utf-8")
     if len(raw) > MAX_RENDER_BYTES:
         raise SystemExit("rendered output exceeds size limit")
-    parent = path.parent
-    if (parent.is_symlink() or not parent.is_dir()
-            or parent.resolve(strict=True) != parent
-            or not parent.is_relative_to(repo)):
-        raise SystemExit("rendered output directory is not a regular repository directory")
-    if path.is_symlink() or (path.exists() and not stat.S_ISREG(path.lstat().st_mode)):
-        raise SystemExit("rendered output is a symlink or non-regular file")
-    directory_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
-    temp_name = f".{path.name}.{secrets.token_hex(12)}.tmp"
-    try:
-        fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                     0o644, dir_fd=directory_fd)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(raw)
-                stream.flush()
-                os.fsync(stream.fileno())
-            # Replacing a path inside the already-open directory never writes
-            # through an entry that was swapped to a symlink.
-            os.replace(temp_name, path.name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        finally:
-            try:
-                os.unlink(temp_name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
-    finally:
-        os.close(directory_fd)
+    if path != repo / "views" / "rendered" / path.name:
+        raise SystemExit("rendered output path is outside the repository render directory")
+    secure_write_rendered(repo, path.stem, raw)
     return hashlib.sha256(raw).hexdigest()
 
 def load_yaml(path: Path):
@@ -104,12 +78,14 @@ def main() -> None:
     assert_new(repo, execution_path)
     assert_new(repo, drift_path)
 
+    snapshot = object_index(repo)
+    policy_snapshot = {relative: safe_bytes(repo, relative) for relative in POLICY_PATHS}
     corpus = load_yaml(corpus_index_path)
     view = load_yaml(view_path)
-    profile_cfg = load_yaml(profile_cfg_path)
-    order_cfg = load_yaml(order_cfg_path)
-    targets_cfg = load_yaml(targets_cfg_path)
-    redaction_cfg = load_yaml(redaction_cfg_path)
+    profile_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[0]])
+    order_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[1]])
+    targets_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[2]])
+    redaction_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[3]])
 
     corpus_id = corpus["spec"]["corpus_id"]
     view_id = view["spec"]["view_id"]
@@ -318,9 +294,11 @@ def main() -> None:
     for node_id in node_ids:
         seq = node_id.rsplit(".", 1)[-1]
         node_path = node_dir / f"node-{seq}.yaml"
-        if not node_path.exists():
-            raise SystemExit(f"missing node file for {node_id}: {node_path}")
-        node = load_yaml(node_path)
+        if node_id not in snapshot:
+            raise SystemExit(f"missing node snapshot for {node_id}: {node_path}")
+        relative, _, node = snapshot[node_id]
+        if relative != f"canon/nodes/{subject_slug}/node-{seq}.yaml":
+            raise SystemExit(f"node ID/path mismatch: {node_id}")
 
         # Rendering is a projection of an existing promoted node. It must not
         # rewrite the promoted source object as a side effect.
@@ -463,7 +441,8 @@ def main() -> None:
     view["spec"]["rendered_projection_refs"] = [rendered_rel_path]
     view["spec"]["derivation_receipt_refs"] = prior_receipts + [execution_receipt_id, drift_receipt_id]
     view["spec"]["generated_at"] = now
-    view["spec"]["view_hash"] = compute_view_hash(repo, subject_slug, view)
+    view["spec"]["view_hash"] = compute_view_hash(
+        repo, subject_slug, view, snapshot=snapshot, policy_bytes=policy_snapshot)
 
     ensure_required_fields(repo, VIEW_KIND, view["spec"])
     validate_instance(repo, view)
