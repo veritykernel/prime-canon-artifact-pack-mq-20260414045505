@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -92,6 +93,33 @@ class ResidualGuardTests(unittest.TestCase):
         cfg_path.write_text(yaml.safe_dump(cfg))
         self.assertEqual(publish(self.repo, SUBJECT, approved_root=stage), target)
         self.assertEqual(target.read_bytes(), (self.repo / "views" / "rendered" / f"{SUBJECT}.md").read_bytes())
+
+    def test_forged_render_body_and_matching_receipt_hashes_stay_blocked(self):
+        self.stage_pack()
+        result = subprocess.run([sys.executable, str(SOURCE / "scripts" / "build_rendered_projection.py"),
+                                 str(self.repo), SUBJECT, "v2"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered = self.repo / "views" / "rendered" / f"{SUBJECT}.md"
+        forged = b"# Forged body unrelated to governed canon\n"
+        rendered.write_bytes(forged)
+        forged_hash = hashlib.sha256(forged).hexdigest()
+        receipt_dir = self.repo / "receipts" / "immutable" / SUBJECT
+        for name in ("render-execution-v2.yaml", "render-drift-v2.yaml"):
+            path = receipt_dir / name
+            receipt = yaml.safe_load(path.read_text())
+            receipt["spec"]["output_sha256"] = forged_hash
+            path.write_text(yaml.safe_dump(receipt, sort_keys=False))
+        self.assertEqual(inspect(self.repo, SUBJECT)[1], "out_of_sync")
+        stage = self.root / "stage"
+        stage.mkdir()
+        stage = stage.resolve()
+        cfg_path = self.repo / "control" / "publish" / "publish-targets.default.yaml"
+        cfg = yaml.safe_load(cfg_path.read_text())
+        cfg["subjects"][SUBJECT]["rendered_markdown_path"] = str(stage / f"{SUBJECT}.rendered.md")
+        cfg_path.write_text(yaml.safe_dump(cfg))
+        with self.assertRaisesRegex(ValueError, "governed render body"):
+            publish(self.repo, SUBJECT, approved_root=stage)
+        self.assertEqual(list(stage.iterdir()), [])
 
     def test_render_builder_rejects_rendered_symlink_without_touching_host_file(self):
         self.stage_pack()
@@ -210,6 +238,23 @@ class ResidualGuardTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("outside a render-only successor", result.stderr)
+
+    def test_history_gate_holds_new_current_view_without_trusted_admission(self):
+        self.stage_pack()
+        for args in (["init", "-q"], ["config", "user.name", "Test"],
+                     ["config", "user.email", "test@example.invalid"],
+                     ["add", "."], ["commit", "-qm", "base"]):
+            subprocess.run(["git", *args], cwd=self.repo, check=True)
+        base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        path = self.repo / "views" / "current" / "new-subject.yaml"
+        path.write_text((self.repo / "views" / "current" / f"{SUBJECT}.yaml").read_text())
+        subprocess.run(["git", "add", str(path)], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "add view"], cwd=self.repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        result = subprocess.run([sys.executable, str(SOURCE / "scripts" / "check_immutable_history.py"), base, head],
+                                cwd=self.repo, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("trusted signed-promotion admission", result.stderr)
 
     def test_history_gate_accepts_verified_render_successor_only(self):
         self.stage_pack()

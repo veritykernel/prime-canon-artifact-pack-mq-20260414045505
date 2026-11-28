@@ -11,6 +11,7 @@ from pathlib import Path
 from promotion_preflight import PromotionRejected, SUBJECT, _yaml
 from render_binding import compute_view_hash
 from render_receipts import active_receipt_paths
+from render_text import expected_rendered_bytes
 from secure_projection_path import DEFAULT_STAGE_ROOT, read_rendered, replace_regular, stage_directory
 
 
@@ -32,6 +33,8 @@ def publish(repo: Path, subject: str, *, approved_root: Path = DEFAULT_STAGE_ROO
     view_spec = view["spec"]
     try:
         actual_view_hash = compute_view_hash(repo, subject, view)
+        generation = execution_path.stem.removeprefix("render-execution").removeprefix("-") or "default"
+        expected_body = expected_rendered_bytes(repo, subject, view, generation)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise PromotionRejected(f"current render inputs could not be verified: {exc}") from exc
     if (spec.get("output_ref") != expected_ref or drift_spec.get("output_ref") != expected_ref
@@ -40,13 +43,15 @@ def publish(repo: Path, subject: str, *, approved_root: Path = DEFAULT_STAGE_ROO
             or drift_spec.get("current_view_hash") != view_spec.get("view_hash")
             or actual_view_hash != view_spec.get("view_hash")
             or drift_spec.get("output_sha256") != spec.get("output_sha256")
+            or spec.get("plan_ref") != f"pc.render_plan.{subject}.{generation}"
+            or spec.get("generated_at") != view_spec.get("generated_at")
             or drift_spec.get("drift_status") != "in_sync"
             or drift_spec.get("blocker") is not False
             or drift_spec.get("recommended_route") != "export_prep"):
         raise PromotionRejected("render receipts and current view do not authorize these exact bytes")
     raw = read_rendered(repo, subject)
-    if hashlib.sha256(raw).hexdigest() != spec.get("output_sha256"):
-        raise PromotionRejected("rendered source bytes differ from execution receipt")
+    if raw != expected_body or hashlib.sha256(raw).hexdigest() != spec.get("output_sha256"):
+        raise PromotionRejected("rendered source bytes differ from governed render body or execution receipt")
     target_value = cfg.get("subjects", {}).get(subject, {}).get("rendered_markdown_path")
     if not isinstance(target_value, str) or not target_value:
         raise PromotionRejected("missing publish target")

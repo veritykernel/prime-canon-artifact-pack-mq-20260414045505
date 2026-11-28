@@ -24,6 +24,7 @@ FROZEN_PATHS = (
     "scripts/check_export_prep.py",
     "scripts/check_render_drift.py",
     "scripts/render_binding.py",
+    "scripts/render_text.py",
     "scripts/render_receipts.py",
     "scripts/secure_projection_path.py",
     "scripts/promotion_preflight.py",
@@ -31,6 +32,7 @@ FROZEN_PATHS = (
     "scripts/validate_pack.py",
     "scripts/enroll_source_units.py",
     "scripts/bootstrap_subject.sh",
+    "scripts/bootstrap_python.sh",
     "scripts/build_evidence_and_admissibility.py",
     "scripts/build_promotion_readiness.py",
     "scripts/build_rendered_projection.py",
@@ -42,6 +44,11 @@ FROZEN_PATHS = (
     "scripts/publish_rendered_subject.sh",
     "scripts/publish_rendered_subject_commit.sh",
     "scripts/publish_verified_subject.py",
+    "control/render/render-profile.default.yaml",
+    "control/render/render-order.default.yaml",
+    "control/render/render-targets.default.yaml",
+    "control/render/render-redaction.default.yaml",
+    "control/publish/publish-targets.default.yaml",
     "requirements.txt",
 )
 MAX_FROZEN_BYTES = 1024 * 1024

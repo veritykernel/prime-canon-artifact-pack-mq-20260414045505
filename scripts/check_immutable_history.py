@@ -62,8 +62,10 @@ def changed_view_issues(base: str, head: str, repo: Path) -> list[str]:
         fields = line.split("\t")
         status, relative = fields[0], fields[-1]
         if status == "A":
-            # A new subject is created by the signed, exclusive promotion
-            # path. Existing views are never overwritten by that path.
+            # CI cannot attest that a candidate ran the external signed
+            # promotion path. Keep new governed views held until a trusted
+            # signer-bound admission check exists on protected main.
+            issues.append(f"{relative}: new current view requires trusted signed-promotion admission")
             continue
         if status != "M":
             issues.append(f"{relative}: existing current view was deleted, renamed or type-changed")

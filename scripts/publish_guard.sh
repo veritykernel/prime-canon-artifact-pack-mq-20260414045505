@@ -4,10 +4,36 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PYTHONDONTWRITEBYTECODE=1
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
-if [ ! -x .venv/bin/python3 ]; then
-  ./scripts/bootstrap_python.sh
-fi
-source .venv/bin/activate
+TRUSTED_PYTHON="${PRIME_CANON_TRUSTED_PYTHON:-}"
+# The interpreter and its packages are installed by the operator outside this
+# checkout. No candidate .venv file or repository bootstrap code is executed.
+/usr/bin/python3 -I -c '
+import os, pathlib, stat, sys
+repo = pathlib.Path(sys.argv[1]).resolve(strict=True)
+path = pathlib.Path(sys.argv[2])
+if not path.is_absolute() or ".." in path.parts or path.is_relative_to(repo):
+    raise SystemExit("trusted Python must be an absolute path outside the repository")
+fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for part in path.parts[1:-1]:
+        info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode):
+            raise SystemExit("trusted Python has a symlink or non-directory ancestor")
+        if info.st_mode & 0o022 and not (info.st_uid == 0 and info.st_mode & stat.S_ISVTX):
+            raise SystemExit("trusted Python has a writable ancestor")
+        next_fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        os.close(fd)
+        fd = next_fd
+    info = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid())
+            or info.st_mode & 0o022 or not info.st_mode & stat.S_IXUSR):
+        raise SystemExit("trusted Python must be an operator-owned regular executable")
+finally:
+    os.close(fd)
+' "$REPO" "$TRUSTED_PYTHON"
+unset PYTHONPATH PYTHONHOME PYTHONUSERBASE VIRTUAL_ENV
+export PYTHONNOUSERSITE=1
+"$TRUSTED_PYTHON" -I -c 'import yaml, jsonschema'
 SUBJECT_SLUG="${SUBJECT_SLUG:-subject-0001}"
 if [ "${1:-}" = "--" ]; then
   shift
@@ -24,5 +50,8 @@ if ! { [ "$#" -eq 4 ] && [ "$1" = python3 ] && [ "$2" = scripts/publish_verified
   echo "publish guard accepts only the verified subject publisher" >&2
   exit 64
 fi
-python3 scripts/check_export_prep.py "$REPO" "$SUBJECT_SLUG"
-exec "$@"
+"$TRUSTED_PYTHON" scripts/check_export_prep.py "$REPO" "$SUBJECT_SLUG"
+if [ "$#" -eq 1 ]; then
+  exec /usr/bin/true
+fi
+exec "$TRUSTED_PYTHON" scripts/publish_verified_subject.py "$REPO" "$SUBJECT_SLUG"

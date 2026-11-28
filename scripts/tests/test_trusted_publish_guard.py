@@ -21,7 +21,7 @@ class TrustedPublishGuardTests(unittest.TestCase):
         for checkout in (self.base, self.candidate):
             checkout.mkdir()
             for directory in ("scripts", ".github", "receipts/immutable",
-                              "canon/nodes", "canon/source_units"):
+                              "canon/nodes", "canon/source_units", "control"):
                 shutil.copytree(SOURCE / directory, checkout / directory,
                                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             shutil.copyfile(SOURCE / "requirements.txt", checkout / "requirements.txt")
@@ -43,6 +43,22 @@ class TrustedPublishGuardTests(unittest.TestCase):
         workflow.unlink()
         workflow.symlink_to(self.base / ".github/workflows/publish-guard-check.yml")
         self.assertTrue(any("publish-guard-check.yml" in issue for issue in
+                            check_candidate(self.base, self.candidate)))
+
+    def test_candidate_bootstrap_or_render_verifier_mutation_is_rejected(self):
+        for name in ("bootstrap_python.sh", "render_text.py"):
+            with self.subTest(name=name):
+                path = self.candidate / "scripts" / name
+                original = path.read_bytes()
+                path.write_bytes(original + b"\n# candidate mutation\n")
+                self.assertTrue(any(name in issue for issue in
+                                    check_candidate(self.base, self.candidate)))
+                path.write_bytes(original)
+
+    def test_candidate_render_policy_mutation_is_rejected(self):
+        policy = self.candidate / "control/render/render-profile.default.yaml"
+        policy.write_text(policy.read_text() + "\n# candidate policy mutation\n")
+        self.assertTrue(any("render-profile.default.yaml" in issue for issue in
                             check_candidate(self.base, self.candidate)))
 
 

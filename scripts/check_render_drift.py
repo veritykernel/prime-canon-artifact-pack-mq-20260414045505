@@ -12,6 +12,7 @@ import yaml
 
 from render_binding import compute_view_hash
 from render_receipts import active_receipt_paths
+from render_text import expected_rendered_bytes
 from secure_projection_path import read_rendered
 from validate_pack import load_yaml as load_bounded_yaml
 
@@ -20,14 +21,6 @@ def load_yaml(path: Path) -> dict:
     if path.is_symlink():
         raise ValueError(f"render input is a symlink: {path}")
     return load_bounded_yaml(path)
-
-
-def current_output_hash(repo: Path, subject_slug: str) -> str | None:
-    try:
-        raw = read_rendered(repo, subject_slug)
-    except FileNotFoundError:
-        return None
-    return hashlib.sha256(raw).hexdigest()
 
 
 def inspect(repo: Path, subject_slug: str) -> tuple[str, str]:
@@ -40,12 +33,20 @@ def inspect(repo: Path, subject_slug: str) -> tuple[str, str]:
     drift = load_yaml(drift_path)
     view_spec, execution_spec, drift_spec = view["spec"], execution["spec"], drift["spec"]
     expected_ref = f"views/rendered/{subject_slug}.md"
-    output_sha = current_output_hash(repo, subject_slug)
+    generation = execution_path.stem.removeprefix("render-execution").removeprefix("-") or "default"
+    expected_body = expected_rendered_bytes(repo, subject_slug, view, generation)
+    try:
+        rendered_body = read_rendered(repo, subject_slug)
+    except FileNotFoundError:
+        rendered_body = None
+    output_sha = hashlib.sha256(rendered_body).hexdigest() if rendered_body is not None else None
+    expected_sha = hashlib.sha256(expected_body).hexdigest()
     current_view_hash = compute_view_hash(repo, subject_slug, view)
 
     if output_sha is None:
         status = "missing_output"
-    elif output_sha != execution_spec.get("output_sha256"):
+    elif (rendered_body != expected_body or output_sha != expected_sha
+          or output_sha != execution_spec.get("output_sha256")):
         status = "out_of_sync"
     elif (current_view_hash != view_spec.get("view_hash")
           or current_view_hash != drift_spec.get("current_view_hash")
@@ -55,6 +56,8 @@ def inspect(repo: Path, subject_slug: str) -> tuple[str, str]:
           or execution_spec.get("target_view_ref") != view_spec.get("view_id")
           or drift_spec.get("target_view_ref") != view_spec.get("view_id")
           or drift_spec.get("plan_ref") != execution_spec.get("plan_ref")
+          or execution_spec.get("plan_ref") != f"pc.render_plan.{subject_slug}.{generation}"
+          or execution_spec.get("generated_at") != view_spec.get("generated_at")
           or drift_spec.get("drift_status") != "in_sync"
           or drift_spec.get("blocker") is not False
           or drift_spec.get("recommended_route") != "export_prep"):

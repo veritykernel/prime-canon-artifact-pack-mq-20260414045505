@@ -13,6 +13,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,20 +30,34 @@ class PromotionRejected(ValueError):
 
 
 def _bytes(repo: Path, path: Path) -> bytes:
-    if not path.resolve().is_relative_to(repo.resolve()):
-        raise PromotionRejected(f"path escapes repository: {path}")
-    if path.is_symlink():
-        raise PromotionRejected(f"symlink input: {path}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK
-    try:
-        fd = os.open(path, flags)
-    except OSError as exc:
-        raise PromotionRejected(f"cannot read input {path}: {exc}") from exc
+    fd = _open_repo_file(repo, path, os.O_RDONLY)
     with os.fdopen(fd, "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
             raise PromotionRejected(f"input is not a bounded regular file: {path}")
         return stream.read(MAX_FILE + 1)
+
+
+def _open_repo_file(repo: Path, path: Path, flags: int) -> int:
+    """Open a repository leaf through pinned, no-follow ancestor descriptors."""
+    from secure_projection_path import _open_directories
+
+    root = repo.resolve(strict=True)
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise PromotionRejected(f"path escapes repository: {path}") from exc
+    if not relative.parts or ".." in relative.parts:
+        raise PromotionRejected(f"unsafe repository path: {path}")
+    try:
+        directory_fd = _open_directories(root, relative.parts[:-1])
+        try:
+            return os.open(relative.name, flags | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK,
+                           dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        raise PromotionRejected(f"cannot open repository input {path}: {exc}") from exc
 
 
 def _yaml(repo: Path, path: Path) -> tuple[dict, bytes]:
@@ -63,25 +78,51 @@ def _digest(raw: bytes) -> str:
 
 
 def _external_file(path: Path, repo: Path, *, root_owned: bool) -> bytes:
-    if path.is_symlink() or path.resolve().is_relative_to(repo.resolve()):
+    if not path.is_absolute() or ".." in path.parts or path.is_relative_to(repo.resolve(strict=True)):
         raise PromotionRejected(f"approval material must be a regular file outside the repository: {path}")
+    directory_fd = os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        info = path.stat()
+        for component in path.parts[1:-1]:
+            ancestor = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            if root_owned and (ancestor.st_uid != 0 or ancestor.st_mode & 0o022):
+                raise PromotionRejected("allowed signer ancestors must be root-owned and not group/world writable")
+            next_fd = os.open(component, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                              | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        fd = os.open(path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK,
+                     dir_fd=directory_fd)
     except OSError as exc:
         raise PromotionRejected(f"missing approval material: {path}") from exc
-    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
-        raise PromotionRejected(f"invalid approval material: {path}")
-    if root_owned and (info.st_uid != 0 or info.st_mode & 0o022):
-        raise PromotionRejected("allowed signers must be root-owned and not group/world writable")
-    return path.read_bytes()
+    finally:
+        os.close(directory_fd)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
+            raise PromotionRejected(f"invalid approval material: {path}")
+        if root_owned and (info.st_uid != 0 or info.st_mode & 0o022):
+            raise PromotionRejected("allowed signers must be root-owned and not group/world writable")
+        raw = stream.read(MAX_FILE + 1)
+    if len(raw) > MAX_FILE:
+        raise PromotionRejected(f"oversized approval material: {path}")
+    return raw
+
+
+def _private_snapshot(directory_fd: int, name: str, raw: bytes) -> None:
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                 0o600, dir_fd=directory_fd)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def verify_approval(repo: Path, approval_path: Path, signature_path: Path,
                     signers_path: Path, expected: dict, *, root_owned: bool = True) -> tuple[str, str]:
     """Return the trusted signer and signed-byte digest after checking scope."""
     raw = _external_file(approval_path, repo, root_owned=False)
-    _external_file(signature_path, repo, root_owned=False)
-    _external_file(signers_path, repo, root_owned=root_owned)
+    signature_raw = _external_file(signature_path, repo, root_owned=False)
+    signers_raw = _external_file(signers_path, repo, root_owned=root_owned)
     try:
         approval = json.loads(raw)
     except (ValueError, UnicodeError) as exc:
@@ -100,11 +141,20 @@ def verify_approval(repo: Path, approval_path: Path, signature_path: Path,
     now = datetime.now(timezone.utc)
     if issued.tzinfo is None or expires.tzinfo is None or issued > now or expires <= now or expires - issued > timedelta(days=30):
         raise PromotionRejected("approval is stale or has an invalid validity window")
-    result = subprocess.run(
-        ["ssh-keygen", "-Y", "verify", "-f", str(signers_path), "-I", PRINCIPAL,
-         "-n", NAMESPACE, "-s", str(signature_path)],
-        input=raw, capture_output=True, check=False, timeout=10,
-    )
+    with tempfile.TemporaryDirectory(prefix="prime-approval-", dir=Path(tempfile.gettempdir()).resolve()) as temp:
+        snapshot_dir = Path(temp)
+        directory_fd = os.open(snapshot_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                               | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            _private_snapshot(directory_fd, "signature", signature_raw)
+            _private_snapshot(directory_fd, "allowed_signers", signers_raw)
+        finally:
+            os.close(directory_fd)
+        result = subprocess.run(
+            ["/usr/bin/ssh-keygen", "-Y", "verify", "-f", str(snapshot_dir / "allowed_signers"),
+             "-I", PRINCIPAL, "-n", NAMESPACE, "-s", str(snapshot_dir / "signature")],
+            input=raw, capture_output=True, check=False, timeout=10,
+        )
     if result.returncode != 0:
         raise PromotionRejected("human approval signature verification failed")
     return PRINCIPAL, _digest(raw)

@@ -4,6 +4,15 @@ Use `scripts/publish_rendered_subject.sh <subject-slug>` for the configured
 stage destination. The target directory must already exist. The guard accepts
 only this verified publisher or its no-effect dry run.
 
+Set `PRIME_CANON_TRUSTED_PYTHON` to an operator-installed Python executable
+outside the checkout with PyYAML and jsonschema installed. The guarded
+publisher checks that this is an absolute, regular, operator-owned executable
+under no-follow, non-writable ancestors. It fails closed when the interpreter
+or dependencies are missing. It never activates the checkout's `.venv` or
+bootstraps packages from the checkout. The operator controls and pins that
+external environment separately; `requirements.txt` is not an install
+authorization or a package lock for guarded publication.
+
 The publisher checks the current view, render execution receipt, and drift
 receipt against the expected subject and output path. It reads the rendered
 source once, verifies the SHA-256 recorded by the execution receipt, and
@@ -22,6 +31,9 @@ bound in the spec and their bytes are checked separately. Export prep and the
 publisher recompute the content root on every use. `check_render_drift.py` is read-only:
 it reports stale inputs without changing an immutable receipt or the view.
 The render builder also leaves promoted node bytes unchanged.
+Verification recomputes the exact Markdown body from the bound canon nodes and
+render policy, including the view's generation time. Matching hashes inserted
+into both candidate receipts cannot authorize unrelated Markdown.
 
 An existing subject with a legacy view hash must receive a reviewed successor
 render generation before it can publish under this binding. Run
@@ -32,6 +44,9 @@ Use a new generation label for each later render. CI preserves previously
 committed immutable receipts, promoted nodes, and reviewed source units. It
 rejects a change to an existing current view unless the change is strictly a
 render-only successor with a new receipt pair and live in-sync verification.
+New current-view additions remain held until a trusted signed-promotion
+admission check is installed; a candidate's claim that it ran the local
+promotion script is not such an attestation.
 
 The publish-guard-check workflow checks a candidate checkout with policy from
 default branch main. The additional `publish-guard-trusted` job runs only code
@@ -46,6 +61,10 @@ review, last-push review, and no-bypass setting remain required.
 The merge-queue proof script accepts only an explicitly selected, empty private
 `veritykernel` fixture with the exact proof marker and owner retention choice.
 It creates a synthetic workflow there and never pushes this repository's source
-commit. Its run selector binds the result to the exact proof PR and merge-group
-run. This script has external GitHub effects and is not part of ordinary
-validation or publication.
+commit. Before touching the fixture, it requires a clean source checkout at
+the exact protected `main` SHA and pins its selector bytes to that commit.
+The synthetic branch changes only a proof marker, and its ruleset requires a
+distinct write-qualified VK code-owner approval on the exact PR head before
+queue merge. Its run selector binds the result to the exact proof PR and
+merge-group run. This script has external GitHub effects and is not part of
+ordinary validation or publication.

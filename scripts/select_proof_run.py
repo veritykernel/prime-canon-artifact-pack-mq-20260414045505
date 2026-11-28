@@ -76,6 +76,29 @@ def merged_pr_matches(pr, *, number, head_sha, not_before):
     )
 
 
+def independent_review_matches(pr, reviews, *, number, head_sha, reviewer):
+    if (not isinstance(pr, dict) or pr.get("number") != number
+            or pr.get("headRefOid") != head_sha or pr.get("reviewDecision") != "APPROVED"
+            or not isinstance(pr.get("author"), dict)
+            or pr["author"].get("login", "").casefold() == reviewer.casefold()
+            or not isinstance(reviews, list)):
+        return False
+    decisions = []
+    for review in reviews:
+        if (not isinstance(review, dict) or not isinstance(review.get("user"), dict)
+                or review["user"].get("login", "").casefold() != reviewer.casefold()
+                or review.get("state") not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")):
+            continue
+        submitted = timestamp(review.get("submitted_at"))
+        if submitted is None or not isinstance(review.get("id"), int):
+            continue
+        decisions.append((submitted, review["id"], review))
+    if not decisions:
+        return False
+    latest = max(decisions)[2]
+    return latest.get("state") == "APPROVED" and latest.get("commit_id") == head_sha
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -89,7 +112,24 @@ def main():
     merged.add_argument("--pr", required=True, type=int)
     merged.add_argument("--head-sha", required=True)
     merged.add_argument("--not-before", required=True)
+    reviewed = subparsers.add_parser("verify-review")
+    reviewed.add_argument("--pr", required=True, type=int)
+    reviewed.add_argument("--head-sha", required=True)
+    reviewed.add_argument("--reviewer", required=True)
+    reviewed.add_argument("pr_json")
+    reviewed.add_argument("reviews_json")
     args = parser.parse_args()
+    if args.action == "verify-review":
+        if not SHA.fullmatch(args.head_sha):
+            parser.error("review verification needs a full exact head")
+        with open(args.pr_json, encoding="utf-8") as stream:
+            pr = json.load(stream)
+        with open(args.reviews_json, encoding="utf-8") as stream:
+            reviews = json.load(stream)
+        if not independent_review_matches(pr, reviews, number=args.pr,
+                                          head_sha=args.head_sha, reviewer=args.reviewer):
+            raise SystemExit("exact-head independent code-owner approval not observed")
+        return
     payload = json.load(sys.stdin)
     if args.action == "select":
         before = timestamp(args.not_before) if args.not_before else None

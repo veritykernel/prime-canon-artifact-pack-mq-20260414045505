@@ -13,6 +13,7 @@ from schema_contract import choose_enum, ensure_required_fields, validate_instan
 from render_binding import POLICY_PATHS, compute_view_hash, object_index, safe_bytes
 from immutable_receipt import assert_new, write_new
 from secure_projection_path import write_rendered as secure_write_rendered
+from render_text import compose_rendered_text
 from validate_pack import load_yaml as load_bounded_yaml
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
@@ -309,48 +310,10 @@ def main() -> None:
         all_source_refs.extend(node["attributes"]["lineage"].get("source_refs", []))
         all_source_unit_refs.extend(node["attributes"]["lineage"].get("source_unit_refs", []))
 
-    lines = []
-    title = f"{subject_slug} rendered canon"
-    if heading_style == "title_only":
-        lines.append(f"# {title}")
-    else:
-        lines.append(f"# {title}")
-    lines.append("")
-
-    metadata_map = {
-        "corpus_id": corpus_id,
-        "current_state_view": view_id,
-        "generated_at": now,
-    }
-
-    for field in include_metadata_fields:
-        if field in metadata_map:
-            lines.append(f"- {field}: `{metadata_map[field]}`")
-    lines.append(f"- active_node_count: `{len(node_objects)}`")
-    lines.append("")
-
-    lines.append("## Promoted canon nodes")
-    lines.append("")
-
-    if section_strategy != "linear_nodes":
-        raise SystemExit(f"unsupported section_strategy in first cycle-2 render refactor: {section_strategy}")
-    if ordering_strategy != "active_node_order":
-        raise SystemExit(f"unsupported ordering_strategy in first cycle-2 render refactor: {ordering_strategy}")
-
-    for idx, node in enumerate(node_objects, start=1):
-        if heading_style == "numbered":
-            lines.append(f"{idx}. {node['spec']['canonical_body']}")
-        else:
-            lines.append(f"- {node['spec']['canonical_body']}")
-
-    if include_receipt_footer:
-        lines.append("")
-        lines.append("## Projection receipts")
-        lines.append("")
-        lines.append(f"- render_profile_ref: `{render_profile['spec']['profile_id']}`")
-        lines.append(f"- render_plan_ref: `{plan_id}`")
-
-    rendered_text = "\n".join(lines) + "\n"
+    rendered_text = compose_rendered_text(
+        subject_slug, corpus_id, view_id, now, node_objects,
+        {POLICY_PATHS[0]: profile_cfg, POLICY_PATHS[1]: order_cfg,
+         POLICY_PATHS[2]: targets_cfg, POLICY_PATHS[3]: redaction_cfg}, generation)
     output_sha256 = write_rendered(repo, rendered_path, rendered_text)
 
     prior_receipts = list(view["spec"].get("derivation_receipt_refs", []))

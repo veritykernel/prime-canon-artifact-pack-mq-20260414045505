@@ -11,7 +11,8 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
-from promotion_preflight import PromotionRejected, preflight
+from promotion_preflight import PromotionRejected, _open_repo_file, preflight
+from secure_projection_path import _open_directories
 
 NODE_KIND = "PRIME_CANON_NODE_V1"
 VIEW_KIND = "PRIME_CANON_CURRENT_STATE_VIEW_V1"
@@ -27,13 +28,43 @@ def claim_seq_from_path(path: Path) -> str:
     return path.stem.replace("claim-", "")
 
 def write_new(repo: Path, path: Path, obj: dict) -> None:
-    """Never overwrite a prior canon object or follow an output symlink."""
-    if not path.parent.resolve().is_relative_to(repo):
-        raise PromotionRejected(f"output path escapes repository: {path}")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(yaml.safe_dump(obj, sort_keys=False))
+    """Create a new object through pinned, no-follow repository directories."""
+    root = repo.resolve(strict=True)
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise PromotionRejected(f"output path escapes repository: {path}") from exc
+    if not relative.parts or ".." in relative.parts:
+        raise PromotionRejected(f"unsafe output path: {path}")
+    try:
+        for depth in range(1, len(relative.parts) - 1):
+            ancestor_fd = _open_directories(root, relative.parts[:depth], create_last=True)
+            os.close(ancestor_fd)
+        directory_fd = _open_directories(root, relative.parts[:-1], create_last=True)
+        created = False
+        try:
+            fd = os.open(relative.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_NOFOLLOW", 0), 0o644, dir_fd=directory_fd)
+            created = True
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(yaml.safe_dump(obj, sort_keys=False))
+                stream.flush()
+                os.fsync(stream.fileno())
+            check_fd = _open_directories(root, relative.parts[:-1])
+            try:
+                pinned, current = os.fstat(directory_fd), os.fstat(check_fd)
+                if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+                    raise PromotionRejected("output parent changed during immutable creation")
+            finally:
+                os.close(check_fd)
+        except BaseException:
+            if created:
+                os.unlink(relative.name, dir_fd=directory_fd)
+            raise
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        raise PromotionRejected(f"cannot create immutable output {path}: {exc}") from exc
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
@@ -92,15 +123,12 @@ def main() -> None:
         outputs.extend((node_dir / f"node-{seq}.yaml", receipt_dir / f"promotion-node-{seq}.yaml"))
     if any(path.exists() or path.is_symlink() for path in outputs):
         raise SystemExit("promotion outputs already exist; reconcile the prior effect before retrying")
-    corpus_fd = os.open(corpus_index_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+    corpus_fd = _open_repo_file(repo, corpus_index_path, os.O_RDWR)
     corpus_stream = os.fdopen(corpus_fd, "r+b")
     fcntl.flock(corpus_stream.fileno(), fcntl.LOCK_EX)
     if hashlib.sha256(corpus_stream.read(2 * 1024 * 1024 + 1)).hexdigest() != frozen["corpus_sha256"]:
         corpus_stream.close()
         raise SystemExit("corpus changed after signed preflight; no promotion outputs written")
-    node_dir.mkdir(parents=True, exist_ok=True)
-    current_view_path.parent.mkdir(parents=True, exist_ok=True)
-
     node_ids = []
     node_receipt_ids = []
     all_source_refs = []

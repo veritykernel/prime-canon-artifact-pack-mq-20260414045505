@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import promotion_preflight
 from promotion_preflight import PromotionRejected, preflight
 import promote_nodes_and_current_state
 from publish_verified_subject import publish
@@ -29,7 +31,7 @@ class PromotionPreflightTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.repo = self.root / "repo"
         for directory in ("canon", "receipts", "replay", "schemas", "control"):
             shutil.copytree(SOURCE / directory, self.repo / directory)
@@ -152,6 +154,77 @@ class PromotionPreflightTests(unittest.TestCase):
         self.approval.write_text(json.dumps(body, sort_keys=True))
         with self.assertRaisesRegex(PromotionRejected, "signature verification failed"):
             self.check()
+
+    def test_shadowed_path_cannot_approve_invalid_signature(self):
+        self.make_policy_ready()
+        self.sign()
+        self.approval.write_bytes(self.approval.read_bytes() + b"\n")
+        shadow = self.root / "shadow-bin"
+        shadow.mkdir()
+        fake = shadow / "ssh-keygen"
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": f"{shadow}:{os.environ.get('PATH', '')}"}), \
+             self.assertRaisesRegex(PromotionRejected, "signature verification failed"):
+            self.check()
+
+    def test_verified_signature_uses_opened_snapshots_after_original_paths_change(self):
+        self.make_policy_ready()
+        self.sign()
+        original = promotion_preflight._external_file
+
+        def swap_after_read(path, repo, *, root_owned):
+            raw = original(path, repo, root_owned=root_owned)
+            if path == self.signers:
+                self.signers.write_text("human:reviewer invalid-key\n")
+                (self.root / "approval.json.sig").write_text("invalid-signature\n")
+            return raw
+
+        with patch.object(promotion_preflight, "_external_file", side_effect=swap_after_read):
+            self.assertEqual(self.check()["reviewer"], "human:reviewer")
+
+    def test_symlinked_approval_ancestor_is_rejected(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "approval.json").write_bytes(self.approval.read_bytes())
+        link = self.root / "linked-parent"
+        link.symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(PromotionRejected):
+            promotion_preflight._external_file(link / "approval.json", self.repo, root_owned=False)
+
+    def test_promotion_output_rejects_symlink_parent(self):
+        parent = self.repo / "canon" / "nodes" / SUBJECT
+        parent.rename(parent.with_name(f"{SUBJECT}-saved"))
+        outside = self.root / "outside"
+        outside.mkdir()
+        parent.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(PromotionRejected, "cannot create immutable output"):
+            promote_nodes_and_current_state.write_new(self.repo, parent / "node-new.yaml", {"safe": True})
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_promotion_output_parent_swap_cannot_redirect_write(self):
+        parent = self.repo / "canon" / "nodes" / SUBJECT
+        saved = parent.with_name(f"{SUBJECT}-saved")
+        outside = self.root / "outside"
+        outside.mkdir()
+        original = promote_nodes_and_current_state._open_directories
+        swapped = False
+
+        def swap_after_open(anchor, components, *, create_last=False):
+            nonlocal swapped
+            fd = original(anchor, components, create_last=create_last)
+            if not swapped and components == ("canon", "nodes", SUBJECT):
+                parent.rename(saved)
+                parent.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return fd
+
+        with patch.object(promote_nodes_and_current_state, "_open_directories", side_effect=swap_after_open):
+            with self.assertRaises(PromotionRejected):
+                promote_nodes_and_current_state.write_new(self.repo, parent / "node-new.yaml", {"safe": True})
+        self.assertTrue(swapped)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((saved / "node-new.yaml").exists())
 
     def test_no_approval_fails_closed(self):
         with self.assertRaisesRegex(PromotionRejected, "external signed human approval"):

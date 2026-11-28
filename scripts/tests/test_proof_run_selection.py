@@ -49,6 +49,22 @@ class ProofRunSelectionTests(unittest.TestCase):
         self.assertFalse(proof.merged_pr_matches({**pr, "headRefOid": QUEUE_HEAD}, number=7, head_sha=HEAD, not_before=BEFORE))
         self.assertFalse(proof.merged_pr_matches({**pr, "mergedAt": "2026-11-25T17:59:59Z"}, number=7, head_sha=HEAD, not_before=BEFORE))
 
+    def test_exact_head_distinct_reviewer_required_before_queue_merge(self):
+        pr = {"number": 7, "headRefOid": HEAD, "reviewDecision": "APPROVED",
+              "author": {"login": "joeyeoj69"}}
+        review = {"id": 3, "user": {"login": "vk-maintainer-joeyeoj69"},
+                  "state": "APPROVED", "commit_id": HEAD,
+                  "submitted_at": "2026-11-25T18:00:03Z"}
+        matches = lambda p, rs: proof.independent_review_matches(
+            p, rs, number=7, head_sha=HEAD, reviewer="vk-maintainer-joeyeoj69")
+        self.assertTrue(matches(pr, [review]))
+        self.assertFalse(matches({**pr, "author": {"login": "vk-maintainer-joeyeoj69"}}, [review]))
+        self.assertFalse(matches(pr, [{**review, "commit_id": QUEUE_HEAD}]))
+        self.assertFalse(matches({**pr, "reviewDecision": "REVIEW_REQUIRED"}, [review]))
+        later_change = {**review, "id": 4, "state": "CHANGES_REQUESTED",
+                        "submitted_at": "2026-11-25T18:01:03Z"}
+        self.assertFalse(matches(pr, [review, later_change]))
+
 
 if __name__ == "__main__":
     unittest.main()
