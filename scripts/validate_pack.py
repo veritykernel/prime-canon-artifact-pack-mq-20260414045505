@@ -12,6 +12,8 @@ from pathlib import Path
 import yaml
 from jsonschema import Draft202012Validator
 
+from secure_projection_path import read_repository_file
+
 
 MAX_OBJECT_BYTES = 2 * 1024 * 1024
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
@@ -67,13 +69,16 @@ def iso_ok(ts: str) -> bool:
         return False
 
 
-def load_yaml(path: Path):
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_OBJECT_BYTES:
-            raise ValueError("not a bounded regular YAML file")
-        raw = stream.read(MAX_OBJECT_BYTES + 1)
+def load_yaml(path: Path, *, repo_root: Path | None = None):
+    if repo_root is not None:
+        raw = read_repository_file(repo_root, path, limit=MAX_OBJECT_BYTES)
+    else:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_OBJECT_BYTES:
+                raise ValueError("not a bounded regular YAML file")
+            raw = stream.read(MAX_OBJECT_BYTES + 1)
     if len(raw) > MAX_OBJECT_BYTES:
         raise ValueError("YAML file exceeds size limit")
     data = yaml.safe_load(raw)
@@ -109,10 +114,12 @@ def main() -> int:
         print(f"ERROR: missing schema bundle: {schema_path}", file=sys.stderr)
         return 2
 
-    if schema_path.stat().st_size > MAX_OBJECT_BYTES:
-        print("ERROR: schema bundle exceeds size limit", file=sys.stderr)
+    try:
+        bundle = json.loads(read_repository_file(repo_root, schema_path,
+                                                 limit=MAX_OBJECT_BYTES))
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: unsafe schema bundle: {exc}", file=sys.stderr)
         return 2
-    bundle = json.loads(schema_path.read_text(encoding="utf-8"))
     validators = build_validators(bundle)
 
     errors = []
@@ -131,7 +138,7 @@ def main() -> int:
             total_bytes += path.lstat().st_size
             if total_bytes > MAX_TOTAL_BYTES:
                 raise ValueError(f"aggregate YAML input exceeds {MAX_TOTAL_BYTES} bytes")
-            data = load_yaml(path)
+            data = load_yaml(path, repo_root=repo_root)
         except (OSError, ValueError, yaml.YAMLError) as exc:
             errors.append(f"{rel}: {exc}")
             if len(errors) >= MAX_ERRORS:

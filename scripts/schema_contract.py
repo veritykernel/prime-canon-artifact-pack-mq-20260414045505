@@ -7,13 +7,15 @@ from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from secure_projection_path import read_repository_file
 
 @lru_cache(maxsize=None)
 def _load_bundle(bundle_path_str: str) -> dict[str, Any]:
-    return json.loads(Path(bundle_path_str).read_text(encoding="utf-8"))
+    path = Path(bundle_path_str)
+    return json.loads(read_repository_file(path.parents[1], path))
 
 def bundle_path(repo_root: Path) -> Path:
-    return (repo_root / "schemas" / "prime-canon-bundle.schema.json").resolve()
+    return repo_root.resolve(strict=True) / "schemas" / "prime-canon-bundle.schema.json"
 
 def bundle(repo_root: Path) -> dict[str, Any]:
     return _load_bundle(str(bundle_path(repo_root)))

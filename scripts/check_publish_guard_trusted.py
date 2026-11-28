@@ -30,12 +30,16 @@ FROZEN_PATHS = (
     "scripts/promotion_preflight.py",
     "scripts/immutable_receipt.py",
     "scripts/validate_pack.py",
+    "scripts/schema_contract.py",
     "scripts/enroll_source_units.py",
+    "scripts/extract_candidate_claims.py",
     "scripts/bootstrap_subject.sh",
     "scripts/bootstrap_python.sh",
     "scripts/build_evidence_and_admissibility.py",
     "scripts/build_promotion_readiness.py",
     "scripts/build_rendered_projection.py",
+    "scripts/scout_contradictions_and_supersession.py",
+    "scripts/freeze_render_plan_family_cycle2.py",
     "scripts/promote_nodes_and_current_state.py",
     "scripts/prove_merge_queue.sh",
     "scripts/select_proof_run.py",
@@ -49,9 +53,14 @@ FROZEN_PATHS = (
     "control/render/render-targets.default.yaml",
     "control/render/render-redaction.default.yaml",
     "control/publish/publish-targets.default.yaml",
+    "schemas/prime-canon-bundle.schema.json",
     "requirements.txt",
 )
 MAX_FROZEN_BYTES = 1024 * 1024
+SHADOW_MODULES = set(getattr(sys, "stdlib_module_names", ())) | {
+    "yaml", "jsonschema", "attrs", "attr", "referencing", "rpds",
+    "jsonschema_specifications",
+}
 
 
 def bounded_regular_bytes(root: Path, relative: str) -> bytes:
@@ -81,6 +90,14 @@ def bounded_regular_bytes(root: Path, relative: str) -> bytes:
 
 def check_candidate(base: Path, candidate: Path) -> list[str]:
     issues = []
+    scripts = candidate / "scripts"
+    if scripts.is_symlink() or not scripts.is_dir():
+        issues.append("candidate has no safe scripts directory")
+    else:
+        for path in scripts.iterdir():
+            module = path.name.split(".", 1)[0]
+            if module in SHADOW_MODULES and not (base / "scripts" / path.name).exists():
+                issues.append(f"scripts/{path.name}: new module shadows a trusted dependency")
     for relative in FROZEN_PATHS:
         try:
             if bounded_regular_bytes(base, relative) != bounded_regular_bytes(candidate, relative):

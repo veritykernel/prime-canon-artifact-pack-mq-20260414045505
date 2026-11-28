@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import os
 import re
-import stat
 import sys
 from itertools import islice
 from datetime import datetime, timezone
@@ -13,6 +11,8 @@ import yaml
 
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
 from immutable_receipt import assert_new, write_new
+from secure_projection_path import (ensure_repository_directory, read_repository_file,
+                                    replace_repository_file)
 
 CONTRADICTION_KIND = "PRIME_CANON_CONTRADICTION_BUNDLE_V1"
 SUPERSESSION_KIND = "PRIME_CANON_SUPERSESSION_EDGE_V1"
@@ -22,16 +22,8 @@ MAX_TEXT = 8192
 MAX_YAML_BYTES = 2 * 1024 * 1024
 
 
-def read_yaml(path: Path) -> dict:
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(fd, "rb") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_YAML_BYTES:
-            raise SystemExit(f"scout input is not a bounded regular file: {path}")
-        raw = stream.read(MAX_YAML_BYTES + 1)
-    if len(raw) > MAX_YAML_BYTES:
-        raise SystemExit(f"scout input exceeds size limit: {path}")
-    return yaml.safe_load(raw)
+def read_yaml(repo: Path, path: Path) -> dict:
+    return yaml.safe_load(read_repository_file(repo, path, limit=MAX_YAML_BYTES))
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -305,6 +297,8 @@ def build_receipt(repo: Path, subject_slug: str, corpus_id: str, now: str, route
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
+        raise SystemExit("invalid subject slug")
 
     claim_dir = repo / "canon" / "candidate_claims" / subject_slug
     admiss_dir = repo / "receipts" / "immutable" / subject_slug
@@ -318,9 +312,8 @@ def main() -> None:
     if not corpus_index_path.exists():
         raise SystemExit(f"missing corpus index: {corpus_index_path}")
 
-    contradiction_dir.mkdir(parents=True, exist_ok=True)
-    supersession_dir.mkdir(parents=True, exist_ok=True)
-    receipt_dir.mkdir(parents=True, exist_ok=True)
+    for directory in (contradiction_dir, supersession_dir, receipt_dir):
+        ensure_repository_directory(repo, directory)
     summary_path = receipt_dir / "topology-scout-summary.yaml"
     assert_new(repo, summary_path)
 
@@ -334,21 +327,22 @@ def main() -> None:
     if len(claim_files) > MAX_CLAIMS or len(admiss_files) > MAX_CLAIMS:
         raise SystemExit(f"topology scout is limited to {MAX_CLAIMS} claims and decisions per run")
 
-    corpus = read_yaml(corpus_index_path)
+    corpus_raw = read_repository_file(repo, corpus_index_path)
+    corpus = yaml.safe_load(corpus_raw)
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
 
     admissibility_by_claim = {}
     cited_receipt_refs = []
     for path in admiss_files:
-        decision = read_yaml(path)
+        decision = read_yaml(repo, path)
         claim_ref = decision["spec"]["target_claim_ref"]
         admissibility_by_claim[claim_ref] = decision
         cited_receipt_refs.append(decision["metadata"]["object_id"])
 
     claims = []
     for path in claim_files:
-        claim = read_yaml(path)
+        claim = read_yaml(repo, path)
         if admissibility_passed(admissibility_by_claim.get(claim["spec"]["claim_id"], {})):
             claims.append(claim)
 
@@ -436,7 +430,8 @@ def main() -> None:
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = route_destination
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_repository_file(repo, corpus_index_path, corpus_raw,
+                            yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
 
     print(f"generated {len(contradiction_refs)} contradiction bundles for {subject_slug}")
     for ref in contradiction_refs:

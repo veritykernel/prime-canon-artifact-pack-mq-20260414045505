@@ -7,28 +7,25 @@ from pathlib import Path
 
 import yaml
 
+from secure_projection_path import create_repository_file, repository_file_directory
+
 
 def assert_new(repo: Path, path: Path) -> None:
-    repo = repo.resolve(strict=True)
-    if path.parent.is_symlink() or not path.parent.resolve(strict=True).is_relative_to(repo):
-        raise SystemExit(f"immutable receipt parent escapes repository: {path}")
-    if path.exists() or path.is_symlink():
+    directory_fd, name = repository_file_directory(repo, path)
+    try:
+        try:
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
         raise SystemExit(f"immutable receipt already exists; create a successor generation: {path}")
+    finally:
+        os.close(directory_fd)
 
 
 def write_new(repo: Path, path: Path, obj: dict) -> None:
     assert_new(repo, path)
     payload = yaml.safe_dump(obj, sort_keys=False)
-    directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
     try:
-        try:
-            fd = os.open(path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                         0o644, dir_fd=directory_fd)
-        except FileExistsError as exc:
-            raise SystemExit(f"immutable receipt already exists; create a successor generation: {path}") from exc
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-    finally:
-        os.close(directory_fd)
+        create_repository_file(repo, path, payload.encode("utf-8"))
+    except FileExistsError as exc:
+        raise SystemExit(f"immutable receipt already exists; create a successor generation: {path}") from exc

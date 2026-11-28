@@ -12,9 +12,10 @@ import yaml
 from schema_contract import choose_enum, ensure_required_fields, validate_instance
 from render_binding import POLICY_PATHS, compute_view_hash, object_index, safe_bytes
 from immutable_receipt import assert_new, write_new
-from secure_projection_path import write_rendered as secure_write_rendered
+from secure_projection_path import (read_repository_file, replace_repository_file,
+                                    write_rendered as secure_write_rendered)
 from render_text import compose_rendered_text
-from validate_pack import load_yaml as load_bounded_yaml
+from validate_pack import check_tree_bound
 
 PROFILE_KIND = "PRIME_CANON_RENDER_PROFILE_V1"
 PLAN_KIND = "PRIME_CANON_RENDER_PLAN_V1"
@@ -38,10 +39,13 @@ def write_rendered(repo: Path, path: Path, rendered_text: str) -> str:
     secure_write_rendered(repo, path.stem, raw)
     return hashlib.sha256(raw).hexdigest()
 
-def load_yaml(path: Path):
-    if not path.exists():
-        raise SystemExit(f"missing yaml: {path}")
-    return load_bounded_yaml(path)
+def load_yaml(repo: Path, path: Path) -> tuple[dict, bytes]:
+    raw = read_repository_file(repo, path)
+    obj = yaml.safe_load(raw)
+    check_tree_bound(obj)
+    if not isinstance(obj, dict):
+        raise ValueError(f"render object is not a mapping: {path}")
+    return obj, raw
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
@@ -81,8 +85,8 @@ def main() -> None:
 
     snapshot = object_index(repo)
     policy_snapshot = {relative: safe_bytes(repo, relative) for relative in POLICY_PATHS}
-    corpus = load_yaml(corpus_index_path)
-    view = load_yaml(view_path)
+    corpus, corpus_raw = load_yaml(repo, corpus_index_path)
+    view, view_raw = load_yaml(repo, view_path)
     profile_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[0]])
     order_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[1]])
     targets_cfg = yaml.safe_load(policy_snapshot[POLICY_PATHS[2]])
@@ -409,7 +413,6 @@ def main() -> None:
 
     ensure_required_fields(repo, VIEW_KIND, view["spec"])
     validate_instance(repo, view)
-    view_path.write_text(yaml.safe_dump(view, sort_keys=False), encoding="utf-8")
 
     current_view_hash = view["spec"]["view_hash"]
 
@@ -497,7 +500,12 @@ def main() -> None:
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "export-prep"
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_repository_file(repo, corpus_index_path, corpus_raw,
+                            yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
+    # The current view is the publication switch; update it only after the
+    # receipts and corpus route have been written successfully.
+    replace_repository_file(repo, view_path, view_raw,
+                            yaml.safe_dump(view, sort_keys=False).encode("utf-8"))
 
     print(render_profile["spec"]["profile_id"])
     print(plan_id)

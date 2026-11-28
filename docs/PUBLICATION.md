@@ -37,6 +37,12 @@ The render builder also leaves promoted node bytes unchanged.
 Verification recomputes the exact Markdown body from the bound canon nodes and
 render policy, including the view's generation time. Matching hashes inserted
 into both candidate receipts cannot authorize unrelated Markdown.
+The claim, evidence, topology, readiness, render and immutable receipt writers
+use descriptor-relative no-follow repository reads and writes. An existing
+governed file must still match its original byte snapshot before replacement;
+the render builder updates the current view only after its paired receipts and
+corpus route are written. A failed multi-file build remains a partial effect
+to reconcile before retrying.
 
 An existing subject with a legacy view hash must receive a reviewed successor
 render generation before it can publish under this binding. Run

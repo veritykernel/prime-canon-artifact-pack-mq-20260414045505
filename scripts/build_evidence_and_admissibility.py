@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +8,9 @@ from pathlib import Path
 import yaml
 
 from schema_contract import choose_enum, ensure_enum, ensure_required_fields, validate_instance
+from promotion_preflight import SUBJECT
+from secure_projection_path import (create_repository_file, ensure_repository_directory,
+                                    read_repository_file, replace_repository_file)
 
 EVIDENCE_LINK_KIND = "PRIME_CANON_EVIDENCE_LINK_V1"
 ADMISSIBILITY_KIND = "PRIME_CANON_ADMISSIBILITY_DECISION_V1"
@@ -37,15 +39,13 @@ def pass_fail_for(repo: Path, unmet_burdens: list[str]) -> str:
     return choose_enum(repo, ADMISSIBILITY_KIND, "pass_fail", preferred, "provisional")
 
 def write_new(repo: Path, path: Path, obj: dict) -> None:
-    if not path.parent.resolve().is_relative_to(repo):
-        raise SystemExit(f"output path escapes repository: {path}")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as stream:
-        stream.write(yaml.safe_dump(obj, sort_keys=False))
+    create_repository_file(repo, path, yaml.safe_dump(obj, sort_keys=False).encode("utf-8"))
 
 def main() -> None:
     repo = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else Path(".").resolve()
     subject_slug = sys.argv[2] if len(sys.argv) > 2 else "subject-0001"
+    if not SUBJECT.fullmatch(subject_slug):
+        raise SystemExit("invalid subject slug")
 
     claim_dir = repo / "canon" / "candidate_claims" / subject_slug
     evidence_dir = repo / "canon" / "evidence_links" / subject_slug
@@ -58,9 +58,7 @@ def main() -> None:
         raise SystemExit(f"missing corpus index: {corpus_index_path}")
 
     for directory in (evidence_dir, receipt_dir):
-        if directory.is_symlink() or not directory.resolve().is_relative_to(repo):
-            raise SystemExit(f"output directory is not a repository directory: {directory}")
-        directory.mkdir(parents=True, exist_ok=True)
+        ensure_repository_directory(repo, directory)
 
     claim_files = sorted(
         p for p in claim_dir.glob("claim-*.yaml")
@@ -76,7 +74,8 @@ def main() -> None:
                (evidence_dir / f"link-{seq}.yaml", receipt_dir / f"admissibility-{seq}.yaml")):
             raise SystemExit(f"prior evidence or admissibility output exists for {seq}; reconcile before rebuilding")
 
-    corpus = yaml.safe_load(corpus_index_path.read_text(encoding="utf-8"))
+    corpus_raw = read_repository_file(repo, corpus_index_path)
+    corpus = yaml.safe_load(corpus_raw)
     corpus_id = corpus["spec"]["corpus_id"]
     now = utc_now()
 
@@ -84,7 +83,7 @@ def main() -> None:
     built_decision_ids = []
 
     for claim_path in claim_files:
-        claim = yaml.safe_load(claim_path.read_text(encoding="utf-8"))
+        claim = yaml.safe_load(read_repository_file(repo, claim_path))
         seq = claim_path.stem.replace("claim-", "")
         claim_id = claim["spec"]["claim_id"]
         source_refs = list(claim["attributes"]["lineage"].get("source_refs", []))
@@ -338,7 +337,8 @@ def main() -> None:
     corpus["attributes"]["temporal"]["reduced_at"] = now
     corpus["attributes"]["temporal"]["status_since"] = now
     corpus["attributes"]["operational"]["route_destination"] = "contradiction"
-    corpus_index_path.write_text(yaml.safe_dump(corpus, sort_keys=False), encoding="utf-8")
+    replace_repository_file(repo, corpus_index_path, corpus_raw,
+                            yaml.safe_dump(corpus, sort_keys=False).encode("utf-8"))
 
     print(f"generated {len(built_link_ids)} evidence links for {subject_slug}")
     for ref in built_link_ids:

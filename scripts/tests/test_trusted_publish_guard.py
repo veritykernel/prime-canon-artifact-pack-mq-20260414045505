@@ -21,7 +21,7 @@ class TrustedPublishGuardTests(unittest.TestCase):
         for checkout in (self.base, self.candidate):
             checkout.mkdir()
             for directory in ("scripts", ".github", "receipts/immutable",
-                              "canon/nodes", "canon/source_units", "control"):
+                              "canon/nodes", "canon/source_units", "control", "schemas"):
                 shutil.copytree(SOURCE / directory, checkout / directory,
                                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
             shutil.copyfile(SOURCE / "requirements.txt", checkout / "requirements.txt")
@@ -59,6 +59,12 @@ class TrustedPublishGuardTests(unittest.TestCase):
         policy = self.candidate / "control/render/render-profile.default.yaml"
         policy.write_text(policy.read_text() + "\n# candidate policy mutation\n")
         self.assertTrue(any("render-profile.default.yaml" in issue for issue in
+                            check_candidate(self.base, self.candidate)))
+
+    def test_candidate_dependency_shadow_is_rejected_by_base_checker(self):
+        shadow = self.candidate / "scripts" / "yaml.py"
+        shadow.write_text("raise RuntimeError('untrusted module')\n")
+        self.assertTrue(any("yaml.py" in issue and "shadows" in issue for issue in
                             check_candidate(self.base, self.candidate)))
 
 

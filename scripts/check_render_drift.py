@@ -17,20 +17,20 @@ from secure_projection_path import read_rendered
 from validate_pack import load_yaml as load_bounded_yaml
 
 
-def load_yaml(path: Path) -> dict:
+def load_yaml(repo: Path, path: Path) -> dict:
     if path.is_symlink():
         raise ValueError(f"render input is a symlink: {path}")
-    return load_bounded_yaml(path)
+    return load_bounded_yaml(path, repo_root=repo)
 
 
 def inspect(repo: Path, subject_slug: str) -> tuple[str, str]:
     repo = repo.resolve(strict=True)
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", subject_slug):
         raise ValueError("invalid subject slug")
-    view = load_yaml(repo / "views" / "current" / f"{subject_slug}.yaml")
+    view = load_yaml(repo, repo / "views" / "current" / f"{subject_slug}.yaml")
     execution_path, drift_path = active_receipt_paths(repo, subject_slug, view)
-    execution = load_yaml(execution_path)
-    drift = load_yaml(drift_path)
+    execution = load_yaml(repo, execution_path)
+    drift = load_yaml(repo, drift_path)
     view_spec, execution_spec, drift_spec = view["spec"], execution["spec"], drift["spec"]
     expected_ref = f"views/rendered/{subject_slug}.md"
     generation = execution_path.stem.removeprefix("render-execution").removeprefix("-") or "default"

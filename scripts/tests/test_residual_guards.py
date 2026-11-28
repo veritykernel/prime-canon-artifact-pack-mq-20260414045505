@@ -40,6 +40,14 @@ class ResidualGuardTests(unittest.TestCase):
             write_new(self.repo, path, {"changed": True})
         self.assertEqual(path.read_text(), "original")
 
+    def test_immutable_writer_rejects_linked_ancestor_without_host_write(self):
+        outside = self.root / "outside"
+        (outside / "immutable").mkdir(parents=True)
+        (self.repo / "receipts").symlink_to(outside, target_is_directory=True)
+        with self.assertRaises((OSError, ValueError)):
+            write_new(self.repo, self.repo / "receipts/immutable/new.yaml", {"unsafe": True})
+        self.assertEqual(list((outside / "immutable").iterdir()), [])
+
     def test_render_builder_refuses_existing_receipts_before_mutating_inputs(self):
         self.stage_pack()
         node = self.repo / "canon" / "nodes" / SUBJECT / "node-0001.yaml"
@@ -162,6 +170,48 @@ class ResidualGuardTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("output target is not a regular file", result.stderr)
         self.assertEqual(outside.read_text(), "keep")
+
+    def test_render_builder_rejects_linked_current_view_ancestor(self):
+        self.stage_pack()
+        view_dir = self.repo / "views" / "current"
+        saved = self.repo / "views" / "current-saved"
+        view_dir.rename(saved)
+        outside = self.root / "outside"
+        outside.mkdir()
+        outside_view = outside / f"{SUBJECT}.yaml"
+        outside_view.write_bytes((saved / f"{SUBJECT}.yaml").read_bytes())
+        view_dir.symlink_to(outside, target_is_directory=True)
+        before = outside_view.read_bytes()
+        result = subprocess.run([sys.executable, str(SOURCE / "scripts" / "build_rendered_projection.py"),
+                                 str(self.repo), SUBJECT, "v2"], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(outside_view.read_bytes(), before)
+        self.assertFalse((self.repo / "receipts" / "immutable" / SUBJECT / "render-execution-v2.yaml").exists())
+
+    def test_claim_extractor_rejects_linked_output_leaf(self):
+        self.stage_pack()
+        outside = self.root / "operator-file"
+        outside.write_text("KEEP")
+        claim = self.repo / "canon" / "candidate_claims" / SUBJECT / "claim-0001.yaml"
+        claim.unlink()
+        claim.symlink_to(outside)
+        result = subprocess.run([sys.executable, str(SOURCE / "scripts" / "extract_candidate_claims.py"),
+                                 str(self.repo), SUBJECT], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(outside.read_text(), "KEEP")
+
+    def test_validator_rejects_linked_schema_bundle(self):
+        self.stage_pack()
+        schema = self.repo / "schemas" / "prime-canon-bundle.schema.json"
+        outside = self.root / "operator-schema.json"
+        outside.write_bytes(schema.read_bytes())
+        schema.unlink()
+        schema.symlink_to(outside)
+        result = subprocess.run([sys.executable, str(SOURCE / "scripts" / "validate_pack.py"),
+                                 str(self.repo)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unsafe schema bundle", result.stderr)
+        self.assertEqual(outside.read_bytes(), (SOURCE / "schemas" / "prime-canon-bundle.schema.json").read_bytes())
         self.assertFalse((self.repo / "receipts" / "immutable" / SUBJECT / "render-execution-v2.yaml").exists())
 
     def test_fifo_render_input_fails_without_waiting_for_a_writer(self):
