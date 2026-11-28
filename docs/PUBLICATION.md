@@ -28,9 +28,10 @@ render generation before it can publish under this binding. Run
 `python3 scripts/build_rendered_projection.py . <subject-slug> v2` in a
 review branch. This adds `render-execution-v2.yaml` and `render-drift-v2.yaml`,
 and the current view names that pair while preserving the original receipts.
-Use a new generation label for each later render. The validator and CI history
-check reject updates or removal of previously committed immutable receipts,
-promoted nodes, and reviewed source units.
+Use a new generation label for each later render. CI preserves previously
+committed immutable receipts, promoted nodes, and reviewed source units. It
+rejects a change to an existing current view unless the change is strictly a
+render-only successor with a new receipt pair and live in-sync verification.
 
 The publish-guard-check workflow checks a candidate checkout with policy from
 default branch main. The additional `publish-guard-trusted` job runs only code

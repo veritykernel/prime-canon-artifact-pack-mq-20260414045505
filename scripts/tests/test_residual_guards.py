@@ -191,6 +191,47 @@ class ResidualGuardTests(unittest.TestCase):
         self.assertIn("node-0001.yaml", result.stderr)
         self.assertIn("unit-0001.yaml", result.stderr)
 
+    def test_history_gate_rejects_structural_current_view_edit(self):
+        self.stage_pack()
+        for args in (["init", "-q"], ["config", "user.name", "Test"],
+                     ["config", "user.email", "test@example.invalid"],
+                     ["add", "."], ["commit", "-qm", "base"]):
+            subprocess.run(["git", *args], cwd=self.repo, check=True)
+        base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        path = self.repo / "views" / "current" / f"{SUBJECT}.yaml"
+        view = yaml.safe_load(path.read_text())
+        view["spec"]["active_node_refs"].pop()
+        path.write_text(yaml.safe_dump(view))
+        subprocess.run(["git", "commit", "-qam", "change view"], cwd=self.repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        result = subprocess.run(
+            [sys.executable, str(SOURCE / "scripts" / "check_immutable_history.py"), base, head],
+            cwd=self.repo, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("outside a render-only successor", result.stderr)
+
+    def test_history_gate_accepts_verified_render_successor_only(self):
+        self.stage_pack()
+        for args in (["init", "-q"], ["config", "user.name", "Test"],
+                     ["config", "user.email", "test@example.invalid"],
+                     ["add", "."], ["commit", "-qm", "base"]):
+            subprocess.run(["git", *args], cwd=self.repo, check=True)
+        base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        built = subprocess.run(
+            [sys.executable, str(SOURCE / "scripts" / "build_rendered_projection.py"),
+             str(self.repo), SUBJECT, "v2"], capture_output=True, text=True,
+        )
+        self.assertEqual(built.returncode, 0, built.stderr)
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "render successor"], cwd=self.repo, check=True)
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        result = subprocess.run(
+            [sys.executable, str(SOURCE / "scripts" / "check_immutable_history.py"), base, head],
+            cwd=self.repo, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_bootstrap_rejects_traversal_before_repo_write(self):
         outside = SOURCE.parent / "codex-bootstrap-traversal-probe"
         self.assertFalse(outside.exists())
